@@ -237,6 +237,19 @@ static NSString *program_env(void) {
     if (!romfs) return nil;
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
+    if (!getenv("DM_ROMFS_OVERLAY")) {
+        NSMutableArray<NSString *> *ov = [NSMutableArray array];
+        NSString *docOv = [doc stringByAppendingPathComponent:@"romfs_overlay"];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:docOv isDirectory:&isDir] && isDir) [ov addObject:docOv];
+        NSString *appOv = [res stringByAppendingPathComponent:@"romfs_overlay"];
+        if ([fm fileExistsAtPath:appOv isDirectory:&isDir] && isDir) [ov addObject:appOv];
+        if (ov.count) {
+            NSString *joined = [ov componentsJoinedByString:@":"];
+            setenv("DM_ROMFS_OVERLAY", joined.fileSystemRepresentation, 0);
+            fprintf(stderr, "boot: romfs overlay %s\n", joined.fileSystemRepresentation);
+        }
+    }
     // The RomFS of the application's other programs (scripts/pack_nup.py, a Switch 2 Edition's Switch 1 program), which the game mounts by program index (hle_fs.c): in the app beside its
     // RomFS, also when that RomFS is Documents/romfs.img
     NSString *sib = [(prog ? [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:prog] : NSBundle.mainBundle.resourcePath) stringByAppendingPathComponent:@"romfs_programs"];
