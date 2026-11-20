@@ -150,6 +150,7 @@ static void launcher_done(void) { [g_root startGame]; }
 // The game view, the pad and the frame-rate counter are made once the launcher has set the switches they read (DM_SHOW_FPS, DM_METAL_HUD); the host's loading began at app launch (main.m)
 - (void)startGame {
     if (self.game) return;
+    dm_game_aspect_drawable(self.view.bounds.size.width, self.view.bounds.size.height);
     dm_cloud_saves_env();   // DM_SAVE_SYNC from the launcher's Cloud saves pick, before the game's first save mount reads it (CloudSaves.m, save_sync.h)
     front_hud_env();   // apply the Play selection before the device check and game view (GitHub issue #840)
     const char *dev = front_ios_device_check();
@@ -201,6 +202,7 @@ static void launcher_done(void) { [g_root startGame]; }
     BOOL duoPortrait = b.size.height > b.size.width && (self.hingeStatus != 0 || !CGRectIsNull(division));
     UIEdgeInsets gameInsets = dm_game_safe_insets(b, self.view.safeAreaInsets, duoPortrait);
     BOOL onTV = self.game.superview != self.view;   // the TV's view lays the picture out; the phone is all pad
+    if (!onTV) dm_game_aspect_drawable(b.size.width, b.size.height);   // the exact-build camera patch widens only to this landscape drawable
     DmLayout layout = onTV ? dm_layout_pad_only(b) : dm_layout_picture(dm_layout(b, gameInsets, self.partiallyOpen, division, g_picture_aspect), b, self.fill, g_picture_aspect);
     if (!onTV) self.game.frame = layout.game;
     layout.topSafeOnly = duoPortrait;
@@ -244,7 +246,11 @@ UIViewController *front_ios_root(void) { return [DmRootVC new]; }
 @end
 @implementation DmTVVC
 - (void)viewDidLoad { [super viewDidLoad]; self.view.backgroundColor = UIColor.blackColor; }
-- (void)viewDidLayoutSubviews { [super viewDidLayoutSubviews]; for (UIView *v in self.view.subviews) v.frame = dm_aspect_fit(self.view.bounds, g_picture_aspect); }
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    dm_game_aspect_drawable(self.view.bounds.size.width, self.view.bounds.size.height);
+    for (UIView *v in self.view.subviews) v.frame = dm_aspect_fit(self.view.bounds, g_picture_aspect);
+}
 @end
 static UIWindow *g_tv; static int g_tv_mode_was = -1;
 static void tv_attach(void) {
