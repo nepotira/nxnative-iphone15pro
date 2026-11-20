@@ -69,32 +69,32 @@ private struct SaveAndModSection: View {
     @State private var pickingSave = false
     @State private var pickingMod = false
     @State private var note: String = ""
-    @State private var modFiles: Int = 0
+    @State private var modFiles: UInt = 0
     @State private var hasBundledMod: Bool = false
 
     var body: some View {
-        Section("Saves & Mods (.zip)") {
-            Button("Import save (.zip)") { pickingSave = true }
+        Section {
+            Button("Import save (.zip)…") { pickingSave = true }
                 .sheet(isPresented: $pickingSave) {
                     DocumentPicker(types: [.zip], asCopy: true) { url in
                         pickingSave = false
-                        var err: NSString?
-                        let count = dm_import_save_zip(url.path, &err)
-                        if count < 0 {
-                            note = (err as String?) ?? "Could not import save archive."
+                        defer { try? FileManager.default.removeItem(at: url) }
+                        var count: UInt = 0
+                        if let err = dm_import_save_zip(url, &count) {
+                            note = err
                         } else {
-                            note = "Imported save (\(count) file\(count == 1 ? "" : "s")). Replaced save backed up in Documents/save-backups."
+                            note = "Imported \(count) save file\(count == 1 ? "" : "s"). Previous save backed up in save-backups."
                         }
                     } onCancel: { pickingSave = false }
                 }
-            Button("Import RomFS mod (.zip)") { pickingMod = true }
+            Button("Import RomFS mod (.zip)…") { pickingMod = true }
                 .sheet(isPresented: $pickingMod) {
                     DocumentPicker(types: [.zip], asCopy: true) { url in
                         pickingMod = false
-                        var err: NSString?
-                        let count = dm_import_romfs_mod_zip(url.path, &err)
-                        if count < 0 {
-                            note = (err as String?) ?? "Could not import RomFS mod archive."
+                        defer { try? FileManager.default.removeItem(at: url) }
+                        var count: UInt = 0
+                        if let err = dm_import_romfs_mod_zip(url, &count) {
+                            note = err
                         } else {
                             refresh()
                             note = "Imported RomFS mod (\(count) file\(count == 1 ? "" : "s")). Active on Play."
