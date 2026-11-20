@@ -21265,6 +21265,7 @@ static MTLViewport present_viewport(double pw, double ph, double dw, double dh) 
 static _Atomic uint64_t g_layer_shape, g_screen_shape;   // w | h << 32, 0 = none
 void mtl_present_layer(uint32_t w, uint32_t h) { atomic_store(&g_layer_shape, (uint64_t)w | (uint64_t)h << 32); }
 void mtl_present_screen(uint32_t w, uint32_t h) { atomic_store(&g_screen_shape, (uint64_t)w | (uint64_t)h << 32); }
+__attribute__((weak)) float dm_game_aspect(void) { return 0; }
 static void present_shape(id<MTLTexture> src, const int crop[4], double *w, double *h) {
     uint64_t v = atomic_load(&g_screen_shape);
     double sr = v ? (double)(uint32_t)v / (double)(v >> 32) : 0;
@@ -21272,6 +21273,8 @@ static void present_shape(id<MTLTexture> src, const int crop[4], double *w, doub
     if (v && fabs(((double)src.width / src.height) / sr - 1) < 0.01) { *w = src.width; *h = src.height; return; }
     v = atomic_load(&g_layer_shape);
     *w = v ? (double)(uint32_t)v : 1920; *h = v ? (double)(v >> 32) : 1080;
+    float wa = dm_game_aspect();
+    if (wa > 16.0f / 9.0f) *w = *h * (double)wa;
 }
 // Picture Fill on the Mac (DM_PICTURE_FIT=fill; on iOS front_ios.m sizes the view larger than the screen instead):
 // the picture covers the whole drawable and its edges are cropped, narrowing the source rectangle r to the drawable's
