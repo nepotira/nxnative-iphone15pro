@@ -1121,8 +1121,35 @@ uint64_t dm_nvn_frame_count(void);
 typedef struct { uint8_t *mem; size_t n; uint64_t frame; int busy; uintptr_t org_lo, org_hi; uint32_t rec_id; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed); rec_id: the recording that took it
 static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg; static uint64_t g_hostseg_bytes;
 static _Atomic int g_hostseg_held;   // busy segments with a guest range: 0 lets hostseg_written return without the lock (no game seen so far lends one from its own pool)
+static int *g_hs_reclaim, g_hs_nreclaim, g_hs_capreclaim;   // indices in g_hostseg with busy && (org_hi > org_lo || rec_id != 0)
+static struct { int *idx; int n, cap; } g_hs_free[3];        // 0: HOSTSEG_SMALL, 1: HOSTSEG_SZ, 2: custom sizes
 static _Atomic uint32_t g_rec_serial;   // BeginRecording's serials (cmd_t rec_id; one that wraps around to a recording whose segment is still lent only keeps that segment lent)
 static pthread_mutex_t g_hostseg_mu = PTHREAD_MUTEX_INITIALIZER;
+static inline int hs_bucket(size_t n) { return n == HOSTSEG_SMALL ? 0 : n == HOSTSEG_SZ ? 1 : 2; }
+static void hs_idx_push(int **arr, int *n, int *cap, int idx) {
+    if (*n == *cap) { int nc = *cap ? *cap * 2 : 64; int *p = realloc(*arr, sizeof **arr * (size_t)nc); if (!p) die("hostseg index table"); *arr = p; *cap = nc; }
+    (*arr)[(*n)++] = idx;
+}
+static int hs_free_pop(size_t n) {
+    int b = hs_bucket(n);
+    while (g_hs_free[b].n > 0) {
+        if (b != 2) {
+            int i = g_hs_free[b].idx[--g_hs_free[b].n];
+            if (!g_hostseg[i].busy && g_hostseg[i].n == n) return i;
+            continue;
+        }
+        for (int k = g_hs_free[b].n - 1; k >= 0; k--) {
+            int j = g_hs_free[b].idx[k];
+            if (g_hostseg[j].busy) { g_hs_free[b].idx[k] = g_hs_free[b].idx[--g_hs_free[b].n]; continue; }
+            if (g_hostseg[j].n == n) { g_hs_free[b].idx[k] = g_hs_free[b].idx[--g_hs_free[b].n]; return j; }
+        }
+        break;
+    }
+    if (g_nhostseg <= 256) {   // small pools (e.g. t_nvn unit test clearing .busy directly)
+        for (int i = 0; i < g_nhostseg; i++) if (!g_hostseg[i].busy && g_hostseg[i].n == n) return i;
+    }
+    return -1;
+}
 static size_t hostseg_size(const cmd_t *o, int empty_pool, size_t want) {
     if (empty_pool) return want && want <= HOSTSEG_SMALL && !o->recording ? HOSTSEG_SMALL : HOSTSEG_SZ;
     return want > HOSTSEG_SZ ? (want + 0xfff) & ~(size_t)0xfff : HOSTSEG_SZ;
@@ -1134,20 +1161,35 @@ static uint8_t *hostseg_take(cmd_t *o, size_t n, const uint8_t *anchor, size_t a
     static unsigned total; uint64_t f = dm_nvn_frame_count(); uint8_t *m = NULL;
     if (o && o->recording && !anchor) ctl_chunk_close(o);   // the records written so far count as written before a free segment is chosen
     uintptr_t lo = 0, hi = 0, cur = o ? (uintptr_t)o->cur : 0;
+    uint32_t rec_id = o ? o->rec_id : 0;
     pthread_mutex_lock(&g_hostseg_mu);
     int in_seg = 0;   // by the segment's end too: a small segment can end where another one starts
-    for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && o->end == g_hostseg[i].mem + g_hostseg[i].n) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
+    for (int r = 0; r < g_hs_nreclaim && cur; r++) {
+        int i = g_hs_reclaim[r];
+        if (g_hostseg[i].busy && cur >= (uintptr_t)g_hostseg[i].mem && o->end == g_hostseg[i].mem + g_hostseg[i].n) {
+            lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break;
+        }
+    }
     if (!in_seg && o && o->recording && cur) {
         uintptr_t own = anchor ? (uintptr_t)anchor : cmd_own(o) && (uintptr_t)cmd_own(o) <= cur ? (uintptr_t)cmd_own(o) : cur < (uintptr_t)o->end ? cur : 0;
         if (own) { lo = own; hi = anchor ? lo + anchor_size : cur > lo ? cur : lo + 1; }
         else { static int once; if (!once++) LOG("[RED] NVN command memory: a recording ran short at the very end of the game's memory with no byte of its own there; the segment the host lends it is never reclaimed"); }
     }
-    for (int i = 0; i < g_nhostseg && !m; i++)
-        if (!g_hostseg[i].busy && g_hostseg[i].n == n) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, n, f, 1, lo, hi, o ? o->rec_id : 0 }; m = g_hostseg[i].mem; }
-    if (!m && g_hostseg_bytes + n <= HOSTSEG_CAP && (m = malloc(n))) {
-        if (g_nhostseg == g_caphostseg) { g_caphostseg = g_caphostseg ? g_caphostseg * 2 : 64; g_hostseg = realloc(g_hostseg, sizeof *g_hostseg * (size_t)g_caphostseg); }
-        g_hostseg[g_nhostseg++] = (hostseg_t){ m, n, f, 1, lo, hi, o ? o->rec_id : 0 }; g_hostseg_bytes += n;
+    int slot = hs_free_pop(n);
+    if (slot >= 0) {
+        g_hostseg[slot] = (hostseg_t){ g_hostseg[slot].mem, n, f, 1, lo, hi, rec_id };
+        m = g_hostseg[slot].mem;
+    } else if (g_hostseg_bytes + n <= HOSTSEG_CAP && (m = malloc(n))) {
+        if (g_nhostseg == g_caphostseg) {
+            int nc = g_caphostseg ? g_caphostseg * 2 : 64;
+            hostseg_t *p = realloc(g_hostseg, sizeof *g_hostseg * (size_t)nc);
+            if (!p) die("hostseg table");
+            g_hostseg = p; g_caphostseg = nc;
+        }
+        slot = g_nhostseg++;
+        g_hostseg[slot] = (hostseg_t){ m, n, f, 1, lo, hi, rec_id }; g_hostseg_bytes += n;
     }
+    if (m && (hi > lo || rec_id)) hs_idx_push(&g_hs_reclaim, &g_hs_nreclaim, &g_hs_capreclaim, slot);
     if (m && hi > lo) atomic_fetch_add_explicit(&g_hostseg_held, 1, memory_order_relaxed);
     unsigned t = anchor ? 0 : ++total; int ns = g_nhostseg; uint64_t bytes = g_hostseg_bytes;
     pthread_mutex_unlock(&g_hostseg_mu);
@@ -1161,9 +1203,18 @@ static void hostseg_written(const cmd_t *o, const uint8_t *p, uint64_t n) {
     if (!n || !atomic_load_explicit(&g_hostseg_held, memory_order_relaxed)) return;
     uintptr_t lo = (uintptr_t)p, hi = lo + n;
     pthread_mutex_lock(&g_hostseg_mu);
-    for (int i = 0; i < g_nhostseg; i++) {
+    for (int r = 0; r < g_hs_nreclaim; ) {
+        int i = g_hs_reclaim[r];
         hostseg_t *s = &g_hostseg[i];
-        if (s->busy && s->org_hi > s->org_lo && s->rec_id != o->rec_id && s->org_hi > lo && s->org_lo < hi) { s->busy = 0; atomic_fetch_sub_explicit(&g_hostseg_held, 1, memory_order_relaxed); }
+        if (!s->busy) { g_hs_reclaim[r] = g_hs_reclaim[--g_hs_nreclaim]; continue; }
+        if (s->org_hi > s->org_lo && s->rec_id != o->rec_id && s->org_hi > lo && s->org_lo < hi) {
+            s->busy = 0;
+            g_hs_reclaim[r] = g_hs_reclaim[--g_hs_nreclaim];
+            hs_idx_push(&g_hs_free[hs_bucket(s->n)].idx, &g_hs_free[hs_bucket(s->n)].n, &g_hs_free[hs_bucket(s->n)].cap, i);
+            atomic_fetch_sub_explicit(&g_hostseg_held, 1, memory_order_relaxed);
+            continue;
+        }
+        r++;
     }
     pthread_mutex_unlock(&g_hostseg_mu);
 }
