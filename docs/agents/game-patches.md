@@ -41,6 +41,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | frame step floor 2 → 1 vsync, and its frame step | frame rate | gap | judgement | 1 | [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) | the game's own clock floor and step; MATCH_CUTS and MATCH_FRAME_STEP could carry the cut and the stub, both near the step's function (main+0x2e7750; one function not checked yet) |
 | `build` → `game` | interval controller: the lower bound and the GPU-time path | frame rate | gap | judgement | 1 | [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | sead::GameFrameworkNx's interval controller in this build; Tears of the Kingdom shares sead but not this code |
 | `build` → `game` | malloc region 60 GB → 4 GB and its first arena | address space | gap | judgement | 1 | [Xenoblade Chronicles 3](../../dm/games/010074F013262000/README.md) | Monolith's own allocator; its constants span two functions (a multi-function rule). The cause, an iPhone's address space, is a platform limit |
+| `build` → `game` | native landscape camera, widened 2D layout ortho and backdrop pane sizing | rendering | gap | checked: verified all four hook addresses, register liveness and opcodes directly in v2 __dmmainx0; not yet run on device | 1 | [Super Mario Odyssey](../../dm/games/0100000000010000/README.md) | the exact-build scene aspect getter, LayoutOrthoSetup and nn::ui2d::Pane::Pane sites on SMO 1.4.1 main |
 | `build` → `game` | PhysX completion task release | race | gap | judgement | 1 | [The Legend of Zelda: Link's Awakening](../../dm/games/01006BB00C6F0000/README.md) | a lifetime race in the game's own completion task (its release slot serves this one vtable) |
 | `build` → `game` | render intervals, the forced-interval flag and the render-wait timeout | frame rate | gap | judgement | 1 | [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md) | the game's own tables, flag and timeout |
 | `build` → `game` | task ring push and pop barriers | race | gap | judgement | 1 | [Batman: Arkham Knight](../../dm/games/0100ACD0163D0000/README.md) | a data race in the game's own task ring |
@@ -95,6 +96,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [South Park: The Fractured But Whole](#south-park-the-fractured-but-whole) | 0 | 0 | 0 | 1 | 0 | `game` → `engine` |
 | [South Park: The Stick of Truth](#south-park-the-stick-of-truth) | 0 | 0 | 0 | 1 | 0 | `game` |
 | [Super Mario 3D All-Stars: Super Mario Sunshine](#super-mario-3d-all-stars-super-mario-sunshine) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
+| [Super Mario Odyssey](#super-mario-odyssey) | 0 | 0 | 4 | 0 | 1 | `build` → `game` |
 | [Super Smash Bros. Ultimate](#super-smash-bros-ultimate) | 11 | 0 | 0 | 1 | 0 | `game` |
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Heroes: Trails into Reverie](#the-legend-of-heroes-trails-into-reverie) | 0 | 0 | 0 | 1 | 0 | `game` |
@@ -554,6 +556,20 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **1.1.4 `main`** `b21e3733…` ([patches.py:7](../../dm/games/010049900F546002/patches.py#L7))
   - cut `+0x151214`: coroutine stack region size: orr w2,wzr,#0x40000000 → mov w2,#0x4000000 (1 GB → 64 MB)
   - cut `+0x151398`: coroutine stack region size, the other start path: 1 GB → 64 MB
+
+### Super Mario Odyssey
+
+[Super Mario Odyssey](../../dm/games/0100000000010000/README.md), `0100000000010000`, [patches.py](../../dm/games/0100000000010000/patches.py).
+
+- **`build` → `game`**, rendering, gap, checked: verified all four hook addresses, register liveness and opcodes directly in v2 __dmmainx0; not yet run on device: native landscape camera, widened 2D layout ortho and backdrop pane sizing. The exact-build scene aspect getter, LayoutOrthoSetup and nn::ui2d::Pane::Pane sites on SMO 1.4.1 main
+
+- **1.4.1 `main`** `b424be15…` ([patches.py:6](../../dm/games/0100000000010000/patches.py#L6))
+  - frame step `+0x6330d4`: full-screen 2D layout: widen ortho projection horizontally to match active drawable ratio
+  - frame step `+0x6330fc`: full-screen 2D layout: widen ortho projection horizontally to match active drawable ratio
+  - frame step `+0x74d2ec`: camera projection: widen 16:9 framebuffer aspect to active drawable ratio (ASPECT_STATE)
+  - frame step `+0x908c3c`: full-screen fades and backdrops: widen 1280x720 non-RootPane quads to cover widened ortho space
+  - launcher capabilities: CAMERA_ASPECT
+  - host [loader.c:406](../../dm/host/loader.c#L406): build check
 
 ### Super Smash Bros. Ultimate
 
