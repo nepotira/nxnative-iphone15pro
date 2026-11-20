@@ -10,13 +10,13 @@ on:
       game_target:
         description: 'On the tunnel: an archive or game file name, or a folder name (ending in / or with no extension). Ignored for Google Drive URLs'
         required: true
-        default: 'PaperMario.7z'
+        default: 'SMO_1.4.1.7z'
       game_name:
-        description: 'Game title for the run name, e.g. Kingdom Hearts Melody Of Memory (optional)'
+        description: 'Game title for the run name (defaults to Super Mario Odyssey)'
         required: false
-        default: ''
+        default: 'Super Mario Odyssey'
       tunnel_url:
-        description: 'Tunnel base URL or Google Drive link. LEAVE EMPTY to use the last one the workflow saved in .github/tunnel-url.txt'
+        description: 'Tunnel base URL or Google Drive link. Leave empty to use secret SMO_TUNNEL_URL or .github/tunnel-url.txt'
         required: false
         default: ''
       device_type:
@@ -62,7 +62,7 @@ on:
         required: false
         default: '27.2'
       romfs_overlay:
-        description: 'Optional: RomFS mod .zip filename on tunnel or https:// URL (e.g. PT_BR.zip) baked as romfs_overlay'
+        description: 'Optional: RomFS mod .zip URL or filename (leave empty to use secret PTBR_OVERLAY_URL; type "none" to skip)'
         required: false
         default: ''
 
@@ -99,12 +99,16 @@ jobs:
         id: tunnel
         env:
           INPUT_URL: ${{ inputs.tunnel_url }}
+          SECRET_URL: ${{ secrets.SMO_TUNNEL_URL }}
         run: |
           set -euo pipefail
           trim() { printf '%s' "$1" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'; }
-          url="$(trim "$INPUT_URL")"; from="the field"
+          url="$(trim "$INPUT_URL")"; from="the field"; is_secret=false
+          if [ -z "$url" ] && [ -n "$(trim "$SECRET_URL")" ]; then
+            url="$(trim "$SECRET_URL")"; from="secret SMO_TUNNEL_URL"; is_secret=true
+          fi
           if [ -z "$url" ]; then
-            [ -f .github/tunnel-url.txt ] || { echo "::error::tunnel_url is empty and .github/tunnel-url.txt does not exist"; exit 1; }
+            [ -f .github/tunnel-url.txt ] || { echo "::error::tunnel_url is empty, secret SMO_TUNNEL_URL is unset, and .github/tunnel-url.txt does not exist"; exit 1; }
             url="$(trim "$(grep -v '^[[:space:]]*#' .github/tunnel-url.txt | head -n1)")"; from=".github/tunnel-url.txt"
           fi
           if [[ ! "$url" =~ ^https?://[^[:space:]]+$ ]]; then
@@ -112,6 +116,7 @@ jobs:
           fi
           echo "Tunnel URL from $from"
           echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "is_secret=$is_secret" >> "$GITHUB_OUTPUT"
 
       - name: Free up disk space
         run: |
@@ -334,7 +339,7 @@ jobs:
 
       - name: Remember the tunnel URL
         # A download from a new tunnel URL is saved for the next run's empty field. Never fails the build (a busy branch, or branch protection).
-        if: steps.cache-game.outputs.cache-hit != 'true' && !contains(steps.tunnel.outputs.url, 'drive.google.com')
+        if: steps.cache-game.outputs.cache-hit != 'true' && steps.tunnel.outputs.is_secret != 'true' && !contains(steps.tunnel.outputs.url, 'drive.google.com')
         continue-on-error: true
         env:
           URL: ${{ steps.tunnel.outputs.url }}
@@ -434,12 +439,17 @@ jobs:
           PY
 
       - name: Download optional RomFS overlay mod
-        if: inputs.romfs_overlay != ''
         env:
           OVERLAY_IN: ${{ inputs.romfs_overlay }}
+          OVERLAY_SECRET: ${{ secrets.PTBR_OVERLAY_URL }}
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
           set -euo pipefail
+          OVERLAY_IN="${OVERLAY_IN:-$OVERLAY_SECRET}"
+          if [ -z "$OVERLAY_IN" ] || [ "$OVERLAY_IN" = "none" ]; then
+            echo "No romfs_overlay requested; skipping"
+            exit 0
+          fi
           arc="$RUNNER_TEMP/romfs_overlay.zip"
           raw="$RUNNER_TEMP/romfs_overlay_raw"
           out="$RUNNER_TEMP/romfs_overlay"
