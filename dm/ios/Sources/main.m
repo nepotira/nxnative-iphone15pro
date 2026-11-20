@@ -174,6 +174,7 @@ static int boot_env(void) {
     }
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
+    setenv("DM_QOS_MAP", "1", 0);   // Map Switch thread priorities to iOS QoS classes by default (env.txt DM_QOS_MAP=0 still overrides)
     front_hud_env();   // DM_METAL_HUD from the launch environment or an env file
     // On the M4 iPad Air, setting MTL_HUD_ENABLED at Play was too late. Apply the saved choice before UIApplicationMain (GitHub issue #840).
     const char *ignore_saved = getenv("DM_SAVED_CHOICES");
