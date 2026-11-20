@@ -2,5 +2,6 @@
 #import "CloudSaves.h"
 #import "DmGameMenu.h"
 #import "DmRotation.h"
+#import "SaveImporter.h"
 #include "save_sync.h"
 int front_screen_max_fps(void);   // front.h, front_ios.m: the Frame rate row offers 40 and 120 only on a 120 Hz screen (LauncherSettings.swift offeredOptions)
