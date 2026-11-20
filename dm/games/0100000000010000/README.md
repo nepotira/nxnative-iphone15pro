@@ -9,8 +9,10 @@ Update 1.4.1 (v393216) over the base game, SDK 7.3.2. Nintendo EPD's sead / agl 
 | `pad_layout full` | `game.tsv` | the 3D gamepad layout |
 | 4 GB layout: `mem_reserve 0x100000000`, `mem_alias 0x10000000`, `mem_stack 0x10000000`, `app_pool 0xCD500000` | `game.tsv` | from the NSP script's provisional profile |
 | Node area cut and 2 MB alignment of large regions (SDK 20's) | `dm/tools/sdk_patches.py` SDK-wide rules, `sdk` build `fcf93a41…` | DRAGON QUEST XI S's build, cut by the SDK-wide rules; Odyssey has no virtual address memory and never allocates an address region |
+| `patches.py` `CAMERA_ASPECT` (`DM_WIDESCREEN`) | `dm/games/0100000000010000/patches.py` (`main` `b424be15…`) | Dynamic native full-screen widescreen: scales 3D scene aspect (`al::getSceneFrameBufferMainAspect`), widens 2D ortho bounds (`LayoutOrthoSetup`), and stretches 1280×720 non-`RootPane` backdrop quads (`nn::ui2d::Pane::Pane`) while keeping HUD centered |
+| `game.tsv` + `pso_manifest.tsv` (iPhone 15 Pro) | `dm/games/0100000000010000/` | `pso_mtl4 on`, `pso_gpu g16p` (A17 Pro `applegpu_g16p`), `present_snap on`, `draw_barriers game`, and 19,547 prewarm entries |
 
-No `patches.py`. `op_mode` stays docked: Odyssey only takes its motion moves in its default docked mode.
+`op_mode` stays docked: Odyssey only takes its motion moves in its default docked mode.
 
 ## Input
 

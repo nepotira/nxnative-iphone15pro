@@ -68,6 +68,9 @@ def payoff(gap):   # the Gaps order: open gaps, then blocked, kept and unreviewe
 
 # The host's build-keyed rows: (table, the start of the row's label ('' = any), main build ('' = any), entry); the first that fits classifies a row
 HOST_BINDING = [
+    ('', '', 'b424be150a8e7d78701cbe7a439d9ebf', {'what': 'native landscape camera, widened 2D layout ortho and backdrop pane sizing', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
+     'why': 'the exact-build scene aspect getter, LayoutOrthoSetup and nn::ui2d::Pane::Pane sites on SMO 1.4.1 main',
+     'checked': 'verified on iPhone 14 (1.4.1); carry over for iPhone 15 Pro verification'}),
     ('k_locks', 'RE Engine', '', {'what': "RE Engine's frame limit at a fixed pointer", 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',
      'why': 'engine code other RE Engine games ship', 'blocked': 'one RE Engine game here'}),
     ('k_locks', 'NLG', '', {'what': "Next Level Games' frame limiter target at a fixed address", 'now': 'build', 'goal': 'engine', 'purpose': 'frame rate',

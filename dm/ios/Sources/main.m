@@ -173,6 +173,7 @@ static int boot_env(void) {
     }
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)
     setenv("DM_ENV_LAUNCH_KEYS", [from_launch componentsJoinedByString:@" "].UTF8String, 1);   // and what the launch environment set (docs/frontends.md, Saved choices)
+    setenv("DM_QOS_MAP", "1", 0);   // Map Switch thread priorities to iOS QoS classes by default (env.txt DM_QOS_MAP=0 still overrides)
     front_hud_env();   // DM_METAL_HUD from the launch environment or an env file
     // On the M4 iPad Air, setting MTL_HUD_ENABLED at Play was too late. Apply the saved choice before UIApplicationMain (GitHub issue #840).
     const char *ignore_saved = getenv("DM_SAVED_CHOICES");
@@ -236,6 +237,19 @@ static NSString *program_env(void) {
     if (!romfs) return nil;
     fprintf(stderr, "boot: game files %s\n", romfs.fileSystemRepresentation);
     setenv("DM_ROMFS", romfs.fileSystemRepresentation, 0);
+    if (!getenv("DM_ROMFS_OVERLAY")) {
+        NSMutableArray<NSString *> *ov = [NSMutableArray array];
+        NSString *docOv = [doc stringByAppendingPathComponent:@"romfs_overlay"];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:docOv isDirectory:&isDir] && isDir) [ov addObject:docOv];
+        NSString *appOv = [res stringByAppendingPathComponent:@"romfs_overlay"];
+        if ([fm fileExistsAtPath:appOv isDirectory:&isDir] && isDir) [ov addObject:appOv];
+        if (ov.count) {
+            NSString *joined = [ov componentsJoinedByString:@":"];
+            setenv("DM_ROMFS_OVERLAY", joined.fileSystemRepresentation, 0);
+            fprintf(stderr, "boot: romfs overlay %s\n", joined.fileSystemRepresentation);
+        }
+    }
     // The RomFS of the application's other programs (scripts/pack_nup.py, a Switch 2 Edition's Switch 1 program), which the game mounts by program index (hle_fs.c): in the app beside its
     // RomFS, also when that RomFS is Documents/romfs.img
     NSString *sib = [(prog ? [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:prog] : NSBundle.mainBundle.resourcePath) stringByAppendingPathComponent:@"romfs_programs"];
