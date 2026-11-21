@@ -2158,8 +2158,9 @@ static void power_line(uint64_t frame) {
     uint64_t iw = pw.cpu_energy.task_interrupt_wakeups, idw = pw.cpu_energy.task_platform_idle_wakeups, g = pw.gpu_energy.task_gpu_utilisation;
     if (pt && t > pt) { double s = (t - pt) / 1e9; char yt[192]; dm_yield_top(yt, sizeof yt);
         double nf = frame > pf ? (double)(frame - pf) : 1;   // per frame: the fair comparison when one build holds the frame rate better than another
+        int th_now = dm_thermal_now(); mtl_thermal_set(th_now);
         LOG("[nvn] power up to frame %llu: CPU energy %.2f W, %.1f mJ per frame (%.1f fps); CPU %.0f%% (100 = one core), %.0f%% of it on performance cores; wakeups %.0f/s (out of platform idle %.0f); GPU %.1f ms/s; thermal %d; top yielders: %s", frame,
-            (e - pe) / 1e9 / s, (e - pe) / 1e6 / nf, nf / s, (cpu - pcpu) / 1e7 / s, cpu > pcpu ? 100.0 * (double)(p - pp) / (double)(cpu - pcpu) : 0, (iw - piw) / s, (idw - ppw) / s, (g - pg) / 1e6 / s, dm_thermal_now(), yt);
+            (e - pe) / 1e9 / s, (e - pe) / 1e6 / nf, nf / s, (cpu - pcpu) / 1e7 / s, cpu > pcpu ? 100.0 * (double)(p - pp) / (double)(cpu - pcpu) : 0, (iw - piw) / s, (idw - ppw) / s, (g - pg) / 1e6 / s, th_now, yt);
         void mtl_dispatch_barrier_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *); static uint64_t pdg, pdc, pdu, pdn; uint64_t dg, dc, du, dn; mtl_dispatch_barrier_stats(&dg, &dc, &du, &dn);
         if (dg + dc + du + dn != pdg + pdc + pdu + pdn) LOG("[nvn] compute dispatches up to frame %llu: %llu after a barrier of the game's, %llu after a copy's range, %llu in the full order (a binding with no range), %llu with no barrier (DM_NVN_DISPATCH_BARRIER)", frame,
             (unsigned long long)(dg - pdg), (unsigned long long)(dc - pdc), (unsigned long long)(du - pdu), (unsigned long long)(dn - pdn));
@@ -2325,9 +2326,31 @@ static rt_thr *rt_register(const char *name, int acq) {   // on the thread itsel
     rt_thr *t = &g_rtt[i]; rt_init(t, name, acq, rt_self_tid()); return t;
 }
 static int rt_allowed(const rt_thr *t) { return rt_on() && (t->acq || rt_frame_on()); }
+static int thermal_proactive_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DM_THERMAL_PROACTIVE");
+#if TARGET_OS_IPHONE
+        on = !e || atoi(e) != 0;
+#else
+        on = e && atoi(e) != 0;
+#endif
+    }
+    return on;
+}
 static void rt_declare(rt_thr *t, uint64_t period_ns, double comp_ms) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
-    double cap = period_ns * 0.9 / 1e6; if (comp_ms > cap) comp_ms = cap; if (comp_ms < 1) comp_ms = 1;
+    double cap = period_ns * 0.9 / 1e6;
+    if (thermal_proactive_on() && !t->acq) {
+        int th = dm_thermal_now();
+        mtl_thermal_set(th);
+        if (th >= 1) {
+            comp_ms *= 0.85;
+            double th_cap = period_ns * 0.45 / 1e6;
+            if (cap > th_cap) cap = th_cap;
+        }
+    }
+    if (comp_ms > cap) comp_ms = cap; if (comp_ms < 1) comp_ms = 1;
     uint64_t comp_ns = (uint64_t)(comp_ms * 1e6);
     thread_time_constraint_policy_data_t p = {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
@@ -2452,6 +2475,7 @@ static int thermal_capped(void) {
         if (now - last >= 1000000000ull) {   // the thermal state is read once a second
             last = now;
             int th = dm_thermal_now();
+            mtl_thermal_set(th);
             if (th >= 2) { calm_since = 0; if (!capped) { capped = 1; LOG("[nvn] thermal state %d: the frame step holds 30 fps until the device is fair again for %llu s (DM_THERMAL_CAP=0 turns this off)", th, THERMAL_CALM_NS / 1000000000ull); } }
             else if (capped) { if (!calm_since) calm_since = now; else if (now - calm_since >= THERMAL_CALM_NS) { capped = 0; LOG("[nvn] thermal state %d for %llu s: back to the frame rate cap", th, THERMAL_CALM_NS / 1000000000ull); } }
         }

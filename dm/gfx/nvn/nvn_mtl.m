@@ -18677,6 +18677,20 @@ typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; uint64_t ma
 static fx_state g_fx_present;   // only the present thread encodes or replaces the scaler
 static id<MTL4Compiler> g_fx_comp;
 static int g_fx_mode = -1;   // 1 = metalfx, 0 = off
+static _Atomic int g_mtl_thermal_state = -1;
+void mtl_thermal_set(int state) { atomic_store_explicit(&g_mtl_thermal_state, state, memory_order_relaxed); }
+static int thermal_proactive_mtl(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DM_THERMAL_PROACTIVE");
+#if TARGET_OS_IPHONE
+        on = !e || atoi(e) != 0;
+#else
+        on = e && atoi(e) != 0;
+#endif
+    }
+    return on;
+}
 static int fx_mode(void) {
     if (g_fx_mode >= 0) return g_fx_mode;
     const char *e = getenv("DM_PRESENT_UPSCALE"); int v = 0;
@@ -18709,6 +18723,17 @@ static id<MTLTexture> fx_tex(__strong id<MTLTexture> *slot, MTLPixelFormat pf, N
 static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTexture> raw, const NSUInteger r[4], MTLViewport vp, MTLPixelFormat out_pf, int remake_wait, id<MTLTexture> canvas, int *wrote) {
     NSUInteger cw = r[2], ch = r[3], ow = (NSUInteger)vp.width, oh = (NSUInteger)vp.height;
     if (fx_mode() != 1 || !fx_wanted(vp, cw, ch)) return nil;
+    if (remake_wait && thermal_proactive_mtl()) {
+        int th = atomic_load_explicit(&g_mtl_thermal_state, memory_order_relaxed);
+        static int fx_shed;
+        if (th >= 1) {
+            if (!fx_shed) { fx_shed = 1; MLOG("DM_THERMAL_PROACTIVE: thermal state %d -> shedding MetalFX present upscale to hardware bilinear", th); }
+            return nil;
+        } else if (fx_shed && th == 0) {
+            fx_shed = 0;
+            MLOG("DM_THERMAL_PROACTIVE: thermal state 0 -> restoring MetalFX present upscale");
+        }
+    }
     NSUInteger key[6] = {cw, ch, raw.pixelFormat, ow, oh, out_pf};
     id<MTL4FXSpatialScaler> sc = fx->sc;
     if (!sc || sc.inputWidth != cw || sc.inputHeight != ch || sc.colorTextureFormat != raw.pixelFormat || sc.outputWidth != ow || sc.outputHeight != oh || sc.outputTextureFormat != out_pf) {
