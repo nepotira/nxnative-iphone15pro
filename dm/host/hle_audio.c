@@ -509,7 +509,7 @@ static void au_request_start(aout *a) {
 // After 200 ms without a callback the silent sink takes over (the game's audio keeps its real-time pace) and the AudioUnit is retried after 1, 2, 4, 8 s. A late wake-up of the watchdog itself (the whole process was stopped) only restarts the count.
 // The time is read under g_aos_lock: the startup helper stamps wd_t under it too, and a watchdog time read before the lock was older than the stamp of an AudioUnit the return from the background had just
 // started (DRAGON QUEST VII Reimagined on an iPhone: "has not called back for 18446744073662 ms", a restart of a running AudioUnit)
-enum { WD_TICK_MS = 50, WD_STALL_MS = 200 };
+enum { WD_TICK_MS = 250, WD_STALL_MS = 200 };
 typedef struct { audio_stats stats; int id, ch; } audio_report;
 // Both consumers hold g_aos_lock. A local copy owns every log argument, so a slow log cannot hold up registry changes or retain a closed output.
 static int stats_take(aout *a, audio_report *r) {
@@ -532,7 +532,7 @@ static void stats_drain(void) {
     for (int i = 0; i < n; i++) stats_log(&reports[i]);
 }
 static void *au_watchdog(void *p) {
-    (void)p; uint64_t last = now_ns();
+    (void)p; dm_host_helper_qos(QOS_CLASS_UTILITY); uint64_t last = now_ns();
     for (;;) {
         usleep(WD_TICK_MS * 1000);
         pthread_mutex_lock(&g_aos_lock);

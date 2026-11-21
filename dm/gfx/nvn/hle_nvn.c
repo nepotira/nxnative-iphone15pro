@@ -1900,7 +1900,9 @@ _Static_assert(DM_QUIT_ARCH_MS == MTL_QUIT_ARCH_MS, "a graceful exit gives the p
 // graphics gate: inside it, going to the background meanwhile (dm_gfx_suspend, on the main thread) waited for it, minutes on a first start. It stays host work for the guest scheduler. The lock
 // comes before the gate: a second submission waiting for it must not count as in flight, or the suspend waits for it while the first waits to enter the closed gate holding the lock
 #include "nvn_queue.inc"
+void dm_thread_promote_interactive(void);   // hle_thread.c
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
+    dm_thread_promote_interactive();
     ((queue_t *)q)->submits++;
     nvn_queue_submit((queue_t *)q,n,(const uint64_t *)h);
 }
@@ -2018,6 +2020,7 @@ uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // Host process start point (main.c; same base as the UIMSG timestamps)
 uint64_t mtl_present_screen_wait(double period);   // nvn_mtl.m
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
+    dm_thread_promote_interactive();
     win_t *o = (win_t *)w;
     int n = window_active(o);
     *idx = n ? o->next++ % n : 0;

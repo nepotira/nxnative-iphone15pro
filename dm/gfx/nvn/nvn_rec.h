@@ -155,6 +155,7 @@ static uint64_t g_rx_ubc;   // the newest uniform shadow the held submissions re
 static struct { uint64_t v; _Atomic uint64_t *p; } g_rx_post[2 * RX_PEND_MAX + 4]; static id g_rx_post_ev[2 * RX_PEND_MAX + 4]; static int g_rx_npost;   // the signals (an event) and notes that followed held commits: made after the real one, in order
 static _Atomic int g_rx_fly, g_rx_held, g_rx_drain, g_rx_busy_hold;   // main command buffers committed and not reported back (DM_NVN_SUB_IDLE_FB); commits are held (rec_drain waits for them); rec_drain callers waiting; tests: the GPU counts as busy
 static id<MTLSharedEvent> g_rx_ev; static uint64_t g_rx_seq;   // signalled with ++g_rx_seq after every commit of the encode thread (rx_mark)
+static MTLSharedEventListener *g_rx_listener; static uint64_t g_rx_armed_seq;   // event-driven wake of rec_thread when g_rx_ev reaches g_rx_seq (DM_NVN_RX_EVENT)
 static uint64_t g_rx_merged, g_rx_cbs; static int g_rx_last_nb;   // submissions held and committed with a later one; commit calls of main command buffers; command buffers in the last one
 static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
 static int rx_merge_on(void) {
@@ -163,11 +164,18 @@ static int rx_merge_on(void) {
         if (!v) MLOG("DM_NVN_SUB_MERGE=0: every submission is committed on its own"); }
     return sw_on(v);
 }
+static int rx_idle_fb_on(void) {
+    static int fbm = -1; if (fbm < 0) fbm = sw_mode("DM_NVN_SUB_IDLE_FB", 0);
+    return fbm && sw_on(fbm);
+}
+static int rx_ev_on(void) {
+    static int evm = -1; if (evm < 0) evm = sw_mode("DM_NVN_RX_EVENT", 1);
+    return sw_on(evm);
+}
 static void rx_mark(void) { if (!g_rx_ev) g_rx_ev = [g_dev newSharedEvent]; [g_q4 signalEvent:g_rx_ev value:++g_rx_seq]; }   // after a commit, under g_res_commit_mu
 static int rx_busy(void) {   // the GPU still runs work the encode thread committed
-    static int fbm = -1; if (fbm < 0) fbm = sw_mode("DM_NVN_SUB_IDLE_FB", 0);
     if (atomic_load_explicit(&g_rx_busy_hold, memory_order_relaxed)) return 1;
-    if (fbm && sw_on(fbm)) return atomic_load(&g_rx_fly) > 0;
+    if (rx_idle_fb_on()) return atomic_load(&g_rx_fly) > 0;
     return g_rx_ev && g_rx_ev.signaledValue < g_rx_seq;
 }
 static double rx_stamp_s(id heap, int slot) {   // a boundary stamp in seconds on the Mach clock, as a commit feedback's GPU times are; 0 when it was not written
@@ -320,8 +328,36 @@ static void *rec_thread(void *arg) {
     for (;;) {
         pthread_mutex_lock(&g_rb_mu);
         while (!g_rb_head) {
-            if (g_rx_npend) {   // held commits and nothing more to encode: a short wait for the next submission while the GPU still has work (looked at every 50 us), then they go
-                for (int k = 0; k < 9 && !g_rb_head && !atomic_load(&g_rx_drain) && rx_busy(); k++) { struct timespec ts = {0, 50000}; g_rb_sleeping = 1; pthread_cond_timedwait_relative_np(&g_rb_work, &g_rb_mu, &ts); g_rb_sleeping = 0; }
+            if (g_rx_npend) {   // held commits and nothing more to encode: wait for the next submission or GPU idle (event-driven via MTLSharedEventListener under DM_NVN_RX_EVENT=1), then flush
+                if (rx_ev_on() && g_rx_ev && !rx_idle_fb_on() && !atomic_load_explicit(&g_rx_busy_hold, memory_order_relaxed)) {
+                    if (!atomic_load(&g_rx_drain) && rx_busy()) {
+                        uint64_t target = g_rx_seq;
+                        if (g_rx_armed_seq != target) {
+                            g_rx_armed_seq = target;
+                            g_rb_busy = 1; pthread_mutex_unlock(&g_rb_mu);
+                            @autoreleasepool {
+                                if (!g_rx_listener) {
+                                    dispatch_queue_attr_t qa = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+                                    g_rx_listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:dispatch_queue_create("dm.nvn.rx-ev", qa)];
+                                }
+                                [g_rx_ev notifyListener:g_rx_listener atValue:target block:^(id<MTLSharedEvent> ev, uint64_t v) {
+                                    (void)ev; (void)v;
+                                    pthread_mutex_lock(&g_rb_mu);
+                                    if (g_rb_sleeping) pthread_cond_signal(&g_rb_work);
+                                    pthread_mutex_unlock(&g_rb_mu);
+                                }];
+                            }
+                            pthread_mutex_lock(&g_rb_mu); g_rb_busy = 0;
+                        }
+                        if (!g_rb_head && !atomic_load(&g_rx_drain) && rx_busy()) {
+                            struct timespec ts = {0, 450000}; g_rb_sleeping = 1;
+                            pthread_cond_timedwait_relative_np(&g_rb_work, &g_rb_mu, &ts);
+                            g_rb_sleeping = 0;
+                        }
+                    }
+                } else {
+                    for (int k = 0; k < 9 && !g_rb_head && !atomic_load(&g_rx_drain) && rx_busy(); k++) { struct timespec ts = {0, 50000}; g_rb_sleeping = 1; pthread_cond_timedwait_relative_np(&g_rb_work, &g_rb_mu, &ts); g_rb_sleeping = 0; }
+                }
                 if (g_rb_head) break;
                 g_rb_busy = 1; pthread_mutex_unlock(&g_rb_mu);
                 @autoreleasepool { rx_flush(); }
