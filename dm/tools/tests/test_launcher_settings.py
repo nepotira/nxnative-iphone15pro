@@ -198,6 +198,19 @@ class LauncherSettingsTests(unittest.TestCase):
                     settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
                 self.assertIn(why, str(e.exception))
 
+    def test_compound_shown_condition_for_widescreen(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(settings.nacp, 'languages', return_value=['en-US']):
+            (Path(tmp) / 'main.fixups.tsv').write_text('# CAMERA_ASPECT\t1\n', encoding='utf-8')
+            with patch.dict(os.environ, {'GFXAPI': 'nvn', 'SETTINGS_PLATFORM': 'ios'}):
+                ios = {s['env']: s for s in settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')['settings']}
+            with patch.dict(os.environ, {'GFXAPI': 'nvn', 'SETTINGS_PLATFORM': 'mac'}):
+                mac = {s['env']: s for s in settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')['settings']}
+        self.assertIn('DM_WIDESCREEN', ios)
+        self.assertEqual(ios['DM_WIDESCREEN']['default'], '1')
+        self.assertNotIn('DM_WIDESCREEN', mac)
+        self.assertIn('DM_PAD_SWAP_FACE', ios)
+        self.assertIn('DM_PAD_SWAP_FACE', mac)
+
 
 def conforms(value, node, root, at='$'):
     """The JSON Schema keywords launcher.schema.json uses (type, required, properties, items, enum, const, pattern, $ref, allOf with
