@@ -8,6 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('log_audit', ROOT / 'dm/tools/log_audit.py')
+assert spec is not None and spec.loader is not None
 log_audit = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = log_audit
 spec.loader.exec_module(log_audit)

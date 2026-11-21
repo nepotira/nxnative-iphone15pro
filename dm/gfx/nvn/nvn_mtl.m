@@ -19164,8 +19164,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         pq_mode = sw_mode("DM_PRESENT_QUEUE", 0);
 #endif
     }
-    id<MTL4CommandQueue> pq = (sw_on(pq_mode) && g_pq4 && g_pq4_ev) ? g_pq4 : g_q4;
-    if (pq == g_pq4) {
+    id<MTL4CommandQueue> pq = (sw_on(pq_mode) && g_pq4 && g_pq4_ev && g_q4) ? g_pq4 : g_q4;
+    if (pq && pq == g_pq4 && g_pq4_ev) {
         uint64_t seq = atomic_fetch_add(&g_pq4_seq, 1) + 1;
         [g_q4 signalEvent:g_pq4_ev value:seq];
         [pq waitForEvent:g_pq4_ev value:seq];

@@ -13,6 +13,7 @@ import argparse
 import re
 import statistics
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -225,7 +226,7 @@ def parse_log(path: Path) -> SessionAudit:
     return audit
 
 
-def _med(vals: list[float | int]) -> float | None:
+def _med(vals: Sequence[float | int]) -> float | None:
     return statistics.median(vals) if vals else None
 
 
