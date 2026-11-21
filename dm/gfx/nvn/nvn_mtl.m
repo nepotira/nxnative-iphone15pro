@@ -139,6 +139,9 @@ static NSMutableArray *g_l3_gpu_leaks;
 static int g_nvn_deswz_gpu;
 static id<MTLCommandQueue> g_q;
 static id<MTL4CommandQueue> g_q4;
+static id<MTL4CommandQueue> g_pq4;   // dedicated present command queue (DM_PRESENT_QUEUE) so waitForDrawable never stalls g_q4
+static id<MTLSharedEvent> g_pq4_ev;
+static _Atomic uint64_t g_pq4_seq;
 static _Atomic int g_classic_ok;   // mtl_device_classic permits fallback while initialization is in progress
 static int g_classic;   // the device has no Metal 4 and only the classic part started
 static dispatch_queue_t g_feedback_q;
@@ -875,6 +878,10 @@ static void mtl_init_once(void) {
         MTL4CommandQueueDescriptor *q4d = [MTL4CommandQueueDescriptor new]; q4d.feedbackQueue = g_feedback_q;
         g_q4 = [g_dev newMTL4CommandQueueWithDescriptor:q4d error:&re];
         if (!g_q4) no4 = "failed to create the MTL4CommandQueue";
+        if (g_q4) {
+            g_pq4 = [g_dev newMTL4CommandQueueWithDescriptor:q4d error:nil];
+            if (g_pq4) g_pq4_ev = [g_dev newSharedEvent];
+        }
     }
     if (no4) {
         const char *why = re ? re.localizedDescription.UTF8String : "";
@@ -2025,7 +2032,8 @@ static uint64_t g_blit_splits;   // copies / buffer updates / fills that ended a
 uint64_t mtl_blit_splits(void) { return g_blit_splits; }
 static int enc_open(void);
 static int g_blit_ct;   // the open copy encoder has the compute argument table set (dispatches share it, dispatch_enc)
-static id<MTL4ComputeCommandEncoder> blit_open(void) { if (g_tf_enc) tf_pass_end(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = g_dw_n = g_dr_n = 0; g_blit_ops = 0; g_blit_ct = 0; } return g_blit; }
+static void rt_mirror_pend_flush(void); static int g_nrtm_pend, g_nrtm_flushing;
+static id<MTL4ComputeCommandEncoder> blit_open(void) { if (g_tf_enc) tf_pass_end(); if (g_nrtm_pend && !g_nrtm_flushing) rt_mirror_pend_flush(); if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = g_dw_n = g_dr_n = 0; g_blit_ops = 0; g_blit_ct = 0; } return g_blit; }
 static void ubd_flush(void); static int g_nubd;   // the inline updates deferred (see mtl_sub_update)
 static int g_ubd_landing;
 static id<MTL4ComputeCommandEncoder> blit_raw(void) {
@@ -2839,6 +2847,7 @@ static void vc_commit(void);
 // it counts, a segment's state list) seals before it: cb_commit seals again and finds nothing left to do
 static void cb_seal(void) {
     if (g_tf_enc) tf_pass_end();
+    if (g_nrtm_pend) rt_mirror_pend_flush();
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush();
     gmem_commit_patch();
@@ -3338,6 +3347,24 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     // of it (rt_view_upgrade), packing the bits in its shader. Nintendo Switch Sports Resort's NDSR upscaler input is one, made again at each new size of its dynamic resolution: without
     // this every one of them was upgraded (copied into a new texture) at its first pass, 27 in 80 s of its menus
     if (d.pixelFormat == MTLPixelFormatRGB9E5Float && (d.usage & MTLTextureUsageRenderTarget)) d.usage |= MTLTextureUsagePixelFormatView;
+    // Optional Apple8+ lossy framebuffer compression (DM_NVN_RT_LOSSY=1/ab): cuts render-target DRAM bandwidth on GPU-only 2D color targets without format-view or shader-write usage.
+    static int rt_lossy_mode = -1;
+    if (rt_lossy_mode < 0) rt_lossy_mode = sw_mode("DM_NVN_RT_LOSSY", 0);
+    if (rt_lossy_mode && sw_on(rt_lossy_mode) && !packaged
+        && (d.usage & MTLTextureUsageRenderTarget)
+        && !(d.usage & (MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite))
+        && d.textureType == MTLTextureType2D && d.sampleCount == 1 && d.mipmapLevelCount == 1
+        && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)
+        && !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))
+        && [g_dev supportsFamily:MTLGPUFamilyApple8]) {
+        MTLPixelFormat lpf = d.pixelFormat;
+        if (lpf == MTLPixelFormatRGBA8Unorm || lpf == MTLPixelFormatRGBA8Unorm_sRGB
+            || lpf == MTLPixelFormatBGRA8Unorm || lpf == MTLPixelFormatBGRA8Unorm_sRGB
+            || lpf == MTLPixelFormatRGB10A2Unorm || lpf == MTLPixelFormatRG11B10Float
+            || lpf == MTLPixelFormatRGBA16Float) {
+            d.compressionType = MTLTextureCompressionTypeLossy;
+        }
+    }
     return d;
 }
 // A level's size as its Metal texture holds it (tex_desc): width, rows, and depth planes (z may be NULL). A 1D (target 0) or 1D array (3) texture is one row; a 1D array's NVN
@@ -6106,15 +6133,50 @@ static void rt_mirror_layers(MTL4RenderPassDescriptor *pd) {
     for (int i = 0; i < g_nrtm; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[g_rtm[i].att];
         g_rtm[i].slice = (unsigned)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_rtm[i].n = pd.renderTargetArrayLength > 1 ? (unsigned)pd.renderTargetArrayLength : 1; }
 }
-// After the pass has ended, every layer it drew. The stores open the copy encoder, which is closed again: callers of rp_end may open an encoder of their own next and rely on none being
-// open (with it left open, Tears of the Kingdom stopped presenting on loading its opening at frame 1983)
-static void rt_mirror_flush(void) {
-    int n = g_nrtm; g_nrtm = 0;
+// After the pass has ended, every layer it drew. Under DM_NVN_GSB_COALESCE=1 (default, ab-testable), consecutive render passes to the same CPU-readable target within one submission coalesce
+// into one swizzle store flushed before any copy/dispatch (blit_open) or command buffer commit (cb_seal).
+static struct { tex_t t; void *tex; unsigned level, slice, n; } g_rtm_pend[32];
+static uint64_t g_gsb_coalesced;
+static int gsb_coalesce_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_GSB_COALESCE", 1); return m; }
+static void rt_mirror_pend_flush(void) {
+    if (!g_nrtm_pend || g_nrtm_flushing) return;
+    g_nrtm_flushing = 1;
+    int n = g_nrtm_pend; g_nrtm_pend = 0;
     for (int i = 0; i < n; i++) {
-        id<MTLTexture> mt = CFBridgingRelease(g_rtm[i].tex);
-        gsb_store(&g_rtm[i].t, mt, g_rtm[i].level, g_rtm[i].slice, g_rtm[i].n, NULL);
+        id<MTLTexture> mt = CFBridgingRelease(g_rtm_pend[i].tex);
+        gsb_store(&g_rtm_pend[i].t, mt, g_rtm_pend[i].level, g_rtm_pend[i].slice, g_rtm_pend[i].n, NULL);
     }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    g_nrtm_flushing = 0;
+}
+static void rt_mirror_flush(void) {
+    int n = g_nrtm; g_nrtm = 0;
+    if (!sw_on(gsb_coalesce_mode())) {
+        for (int i = 0; i < n; i++) {
+            id<MTLTexture> mt = CFBridgingRelease(g_rtm[i].tex);
+            gsb_store(&g_rtm[i].t, mt, g_rtm[i].level, g_rtm[i].slice, g_rtm[i].n, NULL);
+        }
+        if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        int merged = 0;
+        for (int j = 0; j < g_nrtm_pend; j++) {
+            if (g_rtm_pend[j].t.serial == g_rtm[i].t.serial && g_rtm_pend[j].level == g_rtm[i].level
+                && g_rtm_pend[j].slice == g_rtm[i].slice && g_rtm_pend[j].n == g_rtm[i].n) {
+                CFRelease(g_rtm_pend[j].tex);
+                g_rtm_pend[j].tex = g_rtm[i].tex;
+                g_gsb_coalesced++;
+                if (g_gsb_coalesced == 1 || g_gsb_coalesced % 1000 == 0)
+                    MLOG("GPU storage mirror coalescing: %llu redundant swizzle stores skipped (DM_NVN_GSB_COALESCE)", (unsigned long long)g_gsb_coalesced);
+                merged = 1;
+                break;
+            }
+        }
+        if (merged) continue;
+        if (g_nrtm_pend == (int)(sizeof g_rtm_pend / sizeof g_rtm_pend[0])) rt_mirror_pend_flush();
+        g_rtm_pend[g_nrtm_pend++] = (typeof(g_rtm_pend[0])){g_rtm[i].t, g_rtm[i].tex, g_rtm[i].level, g_rtm[i].slice, g_rtm[i].n};
+    }
 }
 static int g_nbcp; static void bcp_flush(void); static void bcp_wrote(const tex_t *t, id<MTLTexture> m); static void bcp_idx(int id_, const tex_t *t, int add);
 static int bcp_before(const tex_t *t, id<MTLTexture> m, tex_t *o); static void bcp_after(const tex_t *t, unsigned level, const NVNcopyRegion *r); static void bcp_after_to(const tex_t *t, const tex_t *op, unsigned level, const NVNcopyRegion *r);   // compressed-alias pairs: sides written in this pass or dispatch (bcp_wrote)
@@ -17299,7 +17361,10 @@ static id<MTLTexture> copy_t2t_enc(const p_copy_t2t *c) {
         int depth = pf == MTLPixelFormatDepth32Float || pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float_Stencil8;
         MTLRenderPassAttachmentDescriptor *a = depth ? rp.depthAttachment : rp.colorAttachments[0];
         a.texture = s; a.level = sl; a.slice = sz0; a.resolveTexture = d; a.resolveLevel = dl; a.resolveSlice = dz0;
-        a.loadAction = MTLLoadActionLoad; a.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        static int msaa_opt_mode = -1;
+        if (msaa_opt_mode < 0) msaa_opt_mode = sw_mode("DM_NVN_MSAA_OPT", 0);
+        int discard_msaa = !depth && msaa_opt_mode && sw_on(msaa_opt_mode);
+        a.loadAction = MTLLoadActionLoad; a.storeAction = discard_msaa ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve;
         if (depth) rp.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
         ser_gate(); enc_r_end(enc_r_begin(rp));
         return d;
@@ -19045,12 +19110,26 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         pthread_mutex_unlock(&g_pq_mu);
     }
     [g_present_alloc4[alloc_i] reset];
-    [g_q4 waitForDrawable:dr];
+    static int pq_mode = -1;
+    if (pq_mode < 0) {
+#if TARGET_OS_IPHONE
+        pq_mode = sw_mode("DM_PRESENT_QUEUE", 1);
+#else
+        pq_mode = sw_mode("DM_PRESENT_QUEUE", 0);
+#endif
+    }
+    id<MTL4CommandQueue> pq = (sw_on(pq_mode) && g_pq4 && g_pq4_ev) ? g_pq4 : g_q4;
+    if (pq == g_pq4) {
+        uint64_t seq = atomic_fetch_add(&g_pq4_seq, 1) + 1;
+        [g_q4 signalEvent:g_pq4_ev value:seq];
+        [pq waitForEvent:g_pq4_ev value:seq];
+    }
+    [pq waitForDrawable:dr];
     id<MTL4CommandBuffer> cb = g_present_cb[alloc_i];
     [cb beginCommandBufferWithAllocator:g_present_alloc4[alloc_i]];
     int kind = present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
     id<MTLResidencySet> drs = ((CAMetalLayer *)dr.layer).residencySet;   // the drawable's
-    if (!kind) { cb_end(cb, drs); [g_q4 signalDrawable:dr]; return 0; }
+    if (!kind) { cb_end(cb, drs); [pq signalDrawable:dr]; return 0; }
     int fx_kind = kind == PRESENT_METALFX;
     cb_end(cb, drs);
     MTL4CommitOptions *o = [MTL4CommitOptions new];
@@ -19063,7 +19142,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};
     pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
-    [g_q4 commit:buffers count:1 options:o];
+    [pq commit:buffers count:1 options:o];
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n;
@@ -19079,7 +19158,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
                  (unsigned long long)g_link_dropped, a[149], a[0], b[149], b[0], b[299], (unsigned long long)atomic_load(&g_link_drained), (unsigned long long)g_link_latched, (unsigned long long)g_link_latch_out);
         }
     }
-    [g_q4 signalDrawable:dr];
+    [pq signalDrawable:dr];
     g_present_alloc_fence[alloc_i] = ticket;
 #if TARGET_OS_SIMULATOR   // The iOS simulator SDK has no presentation-time callback and no minimum display duration (used only for picture acceptance, display-link ticks are not counted)
     (void)period; [dr present];
