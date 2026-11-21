@@ -335,16 +335,26 @@ static void ghost_del_locked(uint64_t k) {   // k's ghost entry goes with its pl
     id old = hm_get_id(&g_ghost, &k); if (!old) return;
     ghost_held_add((__bridge void *)old, -1); obj_drop(old); hm_del_id(&g_ghost, &k); own_note(k);
 }
-// Idle entries past NGHOST go, least recently used first, at most `budget` of them; the first entry in use ends the walk (every one after it was used later)
-static void ghost_trim(unsigned budget) {
+// Idle entries past `keep` go, least recently used first, at most `budget` of them; the first entry in use ends the walk (every one after it was used later)
+static uint32_t ghost_trim_ex(uint32_t keep, uint32_t idle_frames, uint32_t idle_subs, unsigned budget) {
     uint64_t frame = own_hook_frame(), sub = own_hook_submission();
-    for (; budget && g_ghost.n > NGHOST && g_ghost_lru; budget--) {
+    uint32_t n = 0;
+    for (; budget && g_ghost.n > keep && g_ghost_lru; budget--) {
         const ghost_use *u = g_ghost_lru;
-        if (frame - u->frame < GHOST_IDLE && sub - u->sub < GHOST_IDLE_SUBS) break;
+        if (frame - u->frame < idle_frames && sub - u->sub < idle_subs) break;
         ghost_del_locked(u->serial);
+        n++;
     }
+    return n;
 }
+static void ghost_trim(unsigned budget) { (void)ghost_trim_ex(NGHOST, GHOST_IDLE, GHOST_IDLE_SUBS, budget); }
 void own_ghost_trim(void) { pthread_mutex_lock(&g_smu); ghost_trim(GHOST_TRIM); pthread_mutex_unlock(&g_smu); }
+uint32_t own_ghost_trim_target(uint32_t keep, uint32_t idle_frames, uint32_t idle_subs, unsigned budget) {
+    pthread_mutex_lock(&g_smu);
+    uint32_t n = ghost_trim_ex(keep, idle_frames, idle_subs, budget);
+    pthread_mutex_unlock(&g_smu);
+    return n;
+}
 const void *own_resolve_ref(uint64_t k) {
     pthread_mutex_lock(&g_smu); const void *o = nvn_hm_get(&g_by_serial, &k);
     if (!o && g_ghost.n && (o = nvn_hm_get(&g_ghost, &k))) ghost_used(k);
@@ -603,6 +613,36 @@ own_alias_unheld own_alias_unheld_locked(void) {
         if ([o respondsToSelector:@selector(usage)] && (((id<MTLTexture>)o).usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))) s.writable_bytes += b;
     }
     CFRelease(sized); return s;
+}
+uint32_t own_alias_trim_unheld_locked(uint64_t min_idle, uint32_t max_drop, uint64_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+    if (!g_alias.n || !max_drop) return 0;
+    uint64_t now = own_hook_submission();
+    uint32_t cap = max_drop < 64 ? max_drop : 64, nv = 0;
+    alias_key *vk = malloc(cap * sizeof *vk);
+    if (!vk) return 0;
+    for (uint32_t i = 0; i < g_alias.cap && nv < max_drop; i++) {
+        void *v = g_alias.vals[i]; if (!v) continue;
+        id o = (__bridge id)v;
+        if (entry_holds(v) || tex_object_pinned(o)) continue;
+        // Never evict GPU-writable textures here: their contents may only exist in GPU memory.
+        if ([o respondsToSelector:@selector(usage)] && (((id<MTLTexture>)o).usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))) continue;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
+        if (seen && (now <= seen || now - seen < min_idle)) continue;
+        if (nv == cap) { cap *= 2; if (cap > max_drop) cap = max_drop; alias_key *nk = realloc(vk, cap * sizeof *vk); if (!nk) break; vk = nk; }
+        vk[nv++] = k;
+    }
+    uint64_t bytes = 0;
+    for (uint32_t j = 0; j < nv; j++) {
+        id o = hm_get_id(&g_alias, &vk[j]);
+        if ([o respondsToSelector:@selector(allocatedSize)]) bytes += ((id<MTLResource>)o).allocatedSize;
+        alias_del(&vk[j]);
+    }
+    free(vk);
+    if (nv) { own_note(0); g_alias_evicted += nv; }
+    if (bytes_out) *bytes_out = bytes;
+    return nv;
 }
 own_stats own_stats_locked(void) { return (own_stats){.live = g_by_serial.n, .live_cap = g_by_serial.cap, .ghost = g_ghost.n, .retire_wait = g_retire_wait.n, .ghost_puts = g_ghost_puts}; }
 void own_each_locked(void (^fn)(uint64_t serial, id o, int ghost)) {
