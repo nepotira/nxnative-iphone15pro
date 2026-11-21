@@ -40,6 +40,90 @@ static inline uintptr_t re(range_t *r) { return atomic_load_explicit(&r->end, me
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
+// Lock-free, signal-handler-safe sorted interval index for O(log N) lookup in on_fault and prep_write.
+// Double-buffered with a single atomic word (g_idx_state): bit 0 = active buffer (0/1), bits 1..30 = readers in buf 0, bits 32..61 = readers in buf 1.
+// Readers CAS bit 0 + increment its counter atomically (ABA-free); writers (under g_slot_mu) mutate the inactive buffer once its reader count is 0, then flip bit 0.
+typedef struct { uintptr_t base, end, max_end; range_t *r; } idx_ent_t;
+typedef struct { idx_ent_t *ent; int n, cap; } idx_buf_t;
+static idx_buf_t g_idx_buf[2];
+static _Atomic uint64_t g_idx_state;
+static inline int idx_acquire(void) {
+    uint64_t s = atomic_load_explicit(&g_idx_state, memory_order_acquire);
+    for (;;) {
+        int cur = (int)(s & 1u);
+        uint64_t inc = cur ? (1ull << 32) : (1ull << 1);
+        if (atomic_compare_exchange_weak_explicit(&g_idx_state, &s, s + inc, memory_order_acq_rel, memory_order_acquire)) return cur;
+    }
+}
+static inline void idx_release(int cur) {
+    uint64_t inc = cur ? (1ull << 32) : (1ull << 1);
+    atomic_fetch_sub_explicit(&g_idx_state, inc, memory_order_release);
+}
+static int idx_wait_inactive_locked(void) {
+    int cur = (int)(atomic_load_explicit(&g_idx_state, memory_order_acquire) & 1u);
+    int nxt = 1 - cur;
+    uint32_t shift = nxt ? 32u : 1u;
+    while (((atomic_load_explicit(&g_idx_state, memory_order_acquire) >> shift) & 0x3fffffffu) != 0) sched_yield();
+    return nxt;
+}
+static void idx_ensure_cap(idx_buf_t *b, int need) {
+    if (b->cap >= need) return;
+    int cap = b->cap ? b->cap * 2 : 64;
+    while (cap < need) cap *= 2;
+    idx_ent_t *p = realloc(b->ent, (size_t)cap * sizeof *p);
+    if (!p) die("dirty-page tracking sorted index allocation failed (%d entries)", cap);
+    b->ent = p; b->cap = cap;
+}
+static void idx_fix_max_end(idx_buf_t *b, int from) {
+    uintptr_t mx = from > 0 ? b->ent[from - 1].max_end : 0;
+    for (int i = from; i < b->n; i++) {
+        if (b->ent[i].end > mx) mx = b->ent[i].end;
+        b->ent[i].max_end = mx;
+    }
+}
+static void idx_insert_locked(range_t *r, uintptr_t base, uintptr_t end) {
+    int nxt = idx_wait_inactive_locked(), cur = 1 - nxt;
+    const idx_buf_t *src = &g_idx_buf[cur]; idx_buf_t *dst = &g_idx_buf[nxt];
+    int n = src->n;
+    idx_ensure_cap(dst, n + 1);
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (src->ent[mid].base < base) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0) memcpy(dst->ent, src->ent, (size_t)lo * sizeof *dst->ent);
+    dst->ent[lo] = (idx_ent_t){base, end, end, r};
+    if (lo < n) memcpy(dst->ent + lo + 1, src->ent + lo, (size_t)(n - lo) * sizeof *dst->ent);
+    dst->n = n + 1;
+    idx_fix_max_end(dst, lo);
+    atomic_fetch_xor_explicit(&g_idx_state, 1ull, memory_order_acq_rel);
+}
+static void idx_remove_locked(range_t *r) {
+    int nxt = idx_wait_inactive_locked(), cur = 1 - nxt;
+    const idx_buf_t *src = &g_idx_buf[cur]; idx_buf_t *dst = &g_idx_buf[nxt];
+    int n = src->n, pos = -1;
+    for (int i = 0; i < n; i++) if (src->ent[i].r == r) { pos = i; break; }
+    if (pos < 0) return;
+    idx_ensure_cap(dst, n > 1 ? n - 1 : 1);
+    if (pos > 0) memcpy(dst->ent, src->ent, (size_t)pos * sizeof *dst->ent);
+    if (pos + 1 < n) memcpy(dst->ent + pos, src->ent + pos + 1, (size_t)(n - pos - 1) * sizeof *dst->ent);
+    dst->n = n - 1;
+    idx_fix_max_end(dst, pos);
+    atomic_fetch_xor_explicit(&g_idx_state, 1ull, memory_order_acq_rel);
+}
+static inline void idx_bounds(const idx_buf_t *b, uintptr_t a, uintptr_t e, int *lo_out, int *hi_out) {
+    int lo = 0, hi_l = b->n;
+    while (lo < hi_l) {
+        int mid = lo + ((hi_l - lo) >> 1);
+        if (b->ent[mid].max_end <= a) lo = mid + 1; else hi_l = mid;
+    }
+    int hi = lo, hi_r = b->n;
+    while (hi < hi_r) {
+        int mid = hi + ((hi_r - hi) >> 1);
+        if (b->ent[mid].base < e) hi = mid + 1; else hi_r = mid;
+    }
+    *lo_out = lo; *hi_out = hi;
+}
 static uintptr_t g_pg, g_shift;
 static _Atomic uint64_t g_now = 1;
 static _Atomic uint64_t g_faults, g_preps;
@@ -233,9 +317,20 @@ static int on_fault(void *addr, int is_write, void *uc) {
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr;
     for (int tries = 0; tries < 1000; tries++) {
-        uint64_t done = atomic_load(&g_mp_done); int ours = 0, n = atomic_load(&g_nr);
-        for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
-            { range_t *r = rg(i); if (live_at(i) && a >= rb(r) && a < re(r) && pin(r)) { if (a >= rb(r) && a < re(r)) ours |= release_page(r, (a - rb(r)) >> g_shift, &g_faults); unpin(r); } }
+        uint64_t done = atomic_load(&g_mp_done); int ours = 0;
+        int cur = idx_acquire();
+        const idx_buf_t *b = &g_idx_buf[cur];
+        int lo = 0, hi = 0; idx_bounds(b, a, a + 1, &lo, &hi);
+        for (int i = lo; i < hi; i++) {   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
+            if (b->ent[i].end <= a) continue;
+            range_t *r = b->ent[i].r;
+            if (pin(r)) {
+                uintptr_t base = rb(r), end = re(r);
+                if (a >= base && a < end) ours |= release_page(r, (a - base) >> g_shift, &g_faults);
+                unpin(r);
+            }
+        }
+        idx_release(cur);
         if (ours) return 1;
         if (page_writable(a)) return 1;
         if (atomic_load(&g_mp_begun) == done) return 0;   // none begun since the scan began, none in flight then: the page's protection is not this module's
@@ -259,18 +354,23 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
     }
 }
 static void prep_write(void *addr, size_t len) {
-    uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr), in = 0;
+    uintptr_t a = (uintptr_t)addr, e = a + len; int in = 0;
     if (!len) return;
-    for (int i = 0; i < n; i++) {
-        range_t *r = rg(i);
-        if (!live_at(i) || e <= rb(r) || a >= re(r) || !pin(r)) continue;
+    int cur = idx_acquire();
+    const idx_buf_t *b = &g_idx_buf[cur];
+    int lo = 0, hi = 0; idx_bounds(b, a, e, &lo, &hi);
+    for (int i = lo; i < hi; i++) {
+        if (b->ent[i].end <= a) continue;
+        range_t *r = b->ent[i].r;
+        if (!pin(r)) continue;
         uintptr_t base = rb(r), end = re(r);   // pinned: these hold until the unpin
         if (e > base && a < end) {
-            uintptr_t lo = a > base ? a : base, hi = e < end ? e : end; in = 1;
-            release_pages(r, (lo - base) >> g_shift, (hi - 1 - base) >> g_shift, &g_preps);
+            uintptr_t rlo = a > base ? a : base, rhi = e < end ? e : end; in = 1;
+            release_pages(r, (rlo - base) >> g_shift, (rhi - 1 - base) >> g_shift, &g_preps);
         }
         unpin(r);
     }
+    idx_release(cur);
     if (in) own_note();   // whatever its pages' state: one another thread wrote first is writable already
 }
 
@@ -323,6 +423,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     atomic_store_explicit(&r->born, atomic_fetch_add(&g_now, 1) + 1, memory_order_relaxed); atomic_fetch_add(&g_now, 1);   // published by the release store of live below; stamps taken from now on are past it
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    idx_insert_locked(r, base, end);
     atomic_fetch_add(&g_range_epoch, 1);
     pthread_mutex_unlock(&g_slot_mu);
 }
@@ -335,6 +436,7 @@ void nvn_dirty_remove_range(const void *mem) {
         atomic_fetch_add(&g_range_epoch, 1);
         prep_write((void *)rb(r), re(r) - rb(r));
         atomic_store(&r->live, 0);   // seq_cst: against pin (the reuse in add_range reads the pin count)
+        idx_remove_locked(r);
         atomic_fetch_sub(&g_live, 1);
         atomic_fetch_add(&g_range_epoch, 1);
     }
