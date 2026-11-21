@@ -403,7 +403,7 @@ static void install_fps_state(module_t *m) {
     if (m->fps_state_off > m->size || m->size - m->fps_state_off < state_need || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name; dm_fps_step_max = (int)m->step_max;
     if (m->render_scale_max > 1) g_render_scale_max = (float)m->render_scale_max;
-    if (m->camera_aspect && !strcmp(m->name, "main") && !strcmp(m->build_id, "b424be150a8e7d78701cbe7a439d9ebf")) {
+    if (m->camera_aspect && !strcmp(m->name, "main")) {
         pthread_mutex_lock(&g_aspect_mu);
         g_aspect_enabled = aspect_enabled_from_env();
         atomic_store_explicit(&g_aspect_state, dm_fps_state, memory_order_release);
