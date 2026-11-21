@@ -7,15 +7,23 @@
 #pragma once
 #import <GameController/GameController.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "dm_input.h"
 
 static inline int dm_pad_labelled(GCController *c) {
     NSString *k = c.productCategory;
     return [k isEqualToString:@"Switch Pro Controller"] || [k containsString:@"Joy-Con"];
 }
+// DM_PAD_SWAP_FACE=1 inverts A/B and X/Y relative to the auto-detected layout (for third-party Switch-mode pads with Xbox-printed faces)
+static inline int dm_pad_swap_face_env(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_PAD_SWAP_FACE"); v = e && atoi(e) ? 1 : 0; }
+    return v;
+}
 // DM_BTN_A / B / X / Y of the pad's pressed face buttons
 static inline uint64_t dm_pad_face(GCExtendedGamepad *g) {
     GCControllerButtonInput *a = g.buttonA, *b = g.buttonB, *x = g.buttonX, *y = g.buttonY;
-    if (!dm_pad_labelled(g.controller)) { GCControllerButtonInput *t = a; a = b; b = t; t = x; x = y; y = t; }   // by position: right A, bottom B, top X, left Y
+    int swap = !dm_pad_labelled(g.controller) ^ dm_pad_swap_face_env();
+    if (swap) { GCControllerButtonInput *t = a; a = b; b = t; t = x; x = y; y = t; }   // by position: right A, bottom B, top X, left Y
     return (a.isPressed ? DM_BTN_A : 0) | (b.isPressed ? DM_BTN_B : 0) | (x.isPressed ? DM_BTN_X : 0) | (y.isPressed ? DM_BTN_Y : 0);
 }
