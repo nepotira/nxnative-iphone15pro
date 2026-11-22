@@ -7034,17 +7034,20 @@ static id<MTLFunction> fn_dev(id<MTLFunction> f) {
         return dev->fn;
     }
 }
-// A pipeline without the border corrections (dmsh_rewrite.py BORDER_LIVE_FC, DMSH_BORDER_FC): the second specialization of a function already in use. Metal hands out one MTLFunction
-// per function content, device-wide: newFunctionWithName: on the same library, or on another library loaded from the same data, returns the same object (macOS 27.2, M4), and the host
-// keys a function's Metal 4 descriptor and its MTLDevice specialization by that object (fn4_note, fn_dev). So the variant is not a function object of its own: whoever builds a pipeline
-// says which one it builds (off: pso_build, cps_new_b, the mesh pipelines, from pso_key.border), and takes the descriptor from fn4_of_b and the device function from fn_dev_b.
-// A descriptor always holds the shader's own function. fn_off keeps every prior constant of f's descriptor (alpha test, logic operation, merged outputs) and adds the border one;
-// cached by that descriptor. nil: f has no variant (no library descriptor, or its entry point does not declare the constant), and off builds what on builds
-@interface FnOff : NSObject { @public MTL4FunctionDescriptor *d4; MTLFunctionConstantValues *cv; id<MTLFunction> dev; int none, dev_failed; } @end
+// A pipeline without the border corrections (dmsh_rewrite.py BORDER_LIVE_FC, DMSH_BORDER_FC) and/or blend/ROP fixup (dmsh_rewrite.py BLEND_ZERO, DMSH_BLEND_FC):
+// second specializations of a function already in use. Metal hands out one MTLFunction per function content, device-wide: newFunctionWithName: on the same library, or on another
+// library loaded from the same data, returns the same object (macOS 27.2, M4), and the host keys a function's Metal 4 descriptor and its MTLDevice specialization by that object
+// (fn4_note, fn_dev). So the variant is not a function object of its own: whoever builds a pipeline passes a 2-bit off mask (bit 0: dm_border_off, bit 1: dm_blend_off), and takes
+// the descriptor from fn4_of_b and the device function from fn_dev_b.
+// A descriptor always holds the shader's own function. fn_off keeps every prior constant of f's descriptor (alpha test, logic operation, merged outputs) and adds only the constants
+// requested by mask that the entry point actually declares; cached per effective mask (1..3) by that descriptor.
+@interface FnOff : NSObject { @public MTL4FunctionDescriptor *d4[4]; MTLFunctionConstantValues *cv[4]; id<MTLFunction> dev[4]; int probed, have, dev_failed[4]; } @end
 @implementation FnOff @end
 static os_unfair_lock g_fn_off_lock = OS_UNFAIR_LOCK_INIT;
 static NSMapTable *g_fn_off;   // MTL4FunctionDescriptor (fn4_of) → FnOff
-static FnOff *fn_off(id<MTLFunction> f) {
+static FnOff *fn_off_m(id<MTLFunction> f, int mask, int *eff_out) {
+    mask &= 3;
+    if (!mask) return nil;
     MTL4FunctionDescriptor *fd = fn4_of(f);
     if (!fd) return nil;   // no library to specialize from (diagnostic overrides)
     os_unfair_lock_lock(&g_fn_off_lock);
@@ -7053,36 +7056,50 @@ static FnOff *fn_off(id<MTLFunction> f) {
     if (!o) { o = [FnOff new]; [g_fn_off setObject:o forKey:fd]; }
     os_unfair_lock_unlock(&g_fn_off_lock);
     @synchronized(o) {
-        if (o->d4 || o->none) return o->none ? nil : o;
-        MTLFunctionConstantValues *cv = nil;
-        if ([fd isKindOfClass:MTL4SpecializedFunctionDescriptor.class]) {
-            MTL4SpecializedFunctionDescriptor *sd = (MTL4SpecializedFunctionDescriptor *)fd;
-            cv = [sd.constantValues copy]; fd = sd.functionDescriptor;
+        MTLFunctionConstantValues *base_cv = nil;
+        MTL4FunctionDescriptor *inner = fd;
+        if ([inner isKindOfClass:MTL4SpecializedFunctionDescriptor.class]) {
+            MTL4SpecializedFunctionDescriptor *sd = (MTL4SpecializedFunctionDescriptor *)inner;
+            base_cv = sd.constantValues; inner = sd.functionDescriptor;
         }
-        MTL4LibraryFunctionDescriptor *ld = [fd isKindOfClass:MTL4LibraryFunctionDescriptor.class] ? (MTL4LibraryFunctionDescriptor *)fd : nil;
-        // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): the descriptor's name is set when it is made (fn4_note refuses a nil name, pre_fn takes the name its function was made from) and never changed
-        if (!ld || ![ld.library newFunctionWithName:ld.name].functionConstantsDictionary[@"dm_border_off"]) { o->none = 1; return nil; }   // the entry's, not f's: a specialized f lists no constants
-        if (!cv) cv = [MTLFunctionConstantValues new];
-        BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC];
+        MTL4LibraryFunctionDescriptor *ld = [inner isKindOfClass:MTL4LibraryFunctionDescriptor.class] ? (MTL4LibraryFunctionDescriptor *)inner : nil;
+        if (!o->probed) {
+            o->probed = 1;
+            if (ld) {
+                // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): the descriptor's name is set when it is made (fn4_note refuses a nil name, pre_fn takes the name its function was made from) and never changed
+                NSDictionary *fc = [ld.library newFunctionWithName:ld.name].functionConstantsDictionary;   // the entry's, not f's: a specialized f lists no constants
+                if (fc[@"dm_border_off"]) o->have |= 1;
+                if (fc[@"dm_blend_off"]) o->have |= 2;
+            }
+        }
+        int eff = mask & o->have;
+        if (!eff || !ld) return nil;
+        if (eff_out) *eff_out = eff;
+        if (o->d4[eff]) return o;
+        MTLFunctionConstantValues *cv = base_cv ? [base_cv copy] : [MTLFunctionConstantValues new];
+        BOOL yes = YES;
+        if (eff & 1) [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC];
+        if (eff & 2) [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BLEND_FC];
         MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = cv;
-        o->cv = cv; o->d4 = sd;
+        o->cv[eff] = cv; o->d4[eff] = sd;
         return o;
     }
 }
-// f's Metal 4 descriptor, without the border corrections when off
-static MTL4FunctionDescriptor *fn4_of_b(id<MTLFunction> f, int off) { FnOff *o = off ? fn_off(f) : nil; return o ? o->d4 : fn4_of(f); }
-// The function an MTLDevice pipeline is built from (fn_dev), without the border corrections when off: specialized through its library, once. A failed specialization keeps the corrections
+static FnOff *fn_off(id<MTLFunction> f) { return fn_off_m(f, 1, NULL); }
+// f's Metal 4 descriptor, without border (bit 0) and/or blend/ROP fixup (bit 1) corrections when requested in off
+static MTL4FunctionDescriptor *fn4_of_b(id<MTLFunction> f, int off) { int eff = 0; FnOff *o = off ? fn_off_m(f, off, &eff) : nil; return o ? o->d4[eff] : fn4_of(f); }
+// The function an MTLDevice pipeline is built from (fn_dev), specialized according to off (bit 0: dm_border_off, bit 1: dm_blend_off). A failed specialization keeps the corrections
 static id<MTLFunction> fn_dev_b(id<MTLFunction> f, int off) {
-    FnOff *o = off ? fn_off(f) : nil;
+    int eff = 0; FnOff *o = off ? fn_off_m(f, off, &eff) : nil;
     if (!o) return fn_dev(f);
     @synchronized(o) {
-        if (!o->dev && !o->dev_failed) {
-            MTL4LibraryFunctionDescriptor *ld = (MTL4LibraryFunctionDescriptor *)((MTL4SpecializedFunctionDescriptor *)o->d4).functionDescriptor;
-            // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): fn_off made o->d4 from this ld after looking its name up; names are never nil (fn4_note, pre_fn)
-            NSError *e = nil; o->dev = dev_fn(ld.library, ld.name, o->cv, &e);
-            if (!o->dev) { o->dev_failed = 1; MLOG("[RED] function %s: specializing it without the border corrections failed: %s (its pipelines keep them)", f.name.UTF8String, e.localizedDescription.UTF8String); }
+        if (!o->dev[eff] && !o->dev_failed[eff]) {
+            MTL4LibraryFunctionDescriptor *ld = (MTL4LibraryFunctionDescriptor *)((MTL4SpecializedFunctionDescriptor *)o->d4[eff]).functionDescriptor;
+            // NOLINTNEXTLINE(clang-analyzer-nullability.NullablePassedToNonnull): fn_off_m made o->d4[eff] from this ld after looking its name up; names are never nil (fn4_note, pre_fn)
+            NSError *e = nil; o->dev[eff] = dev_fn(ld.library, ld.name, o->cv[eff], &e);
+            if (!o->dev[eff]) { o->dev_failed[eff] = 1; MLOG("[RED] function %s: specializing off mask %d failed: %s (its pipelines keep the corrections)", f.name.UTF8String, eff, e.localizedDescription.UTF8String); }
         }
-        if (o->dev) return o->dev;
+        if (o->dev[eff]) return o->dev[eff];
     }
     return fn_dev(f);
 }
@@ -9449,7 +9466,19 @@ static uint32_t bz_word(const uint8_t *lm) {
 // MAX on both its colour and alpha (they keep one of two stored values, so a colour rounded first keeps the same one), or a logic operation (which takes the place of blending and
 // rounds the colour as the target stores it; dmsh_logic.py dm_logic_norm then finds it exact). sRGB, signed, float, packed 16-bit formats and blended sums (rounded after the blend,
 // out of a shader's reach) keep Apple's conversion. DM_NVN_ROP_ROUND=0 gives 0 for every draw, for A/B runs
-static int rop_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ROP_ROUND"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_ROP_ROUND=0: colours go into normalized targets as Apple's GPU converts them"); } return v; }
+static int rop_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DM_NVN_ROP_ROUND");
+#if TARGET_OS_IPHONE
+        v = (e && !strcmp(e, "1")) ? 1 : 0;   // iOS defaults off so dm_blend_off eliminates per-pixel rint/clamp/div ALU on normalized targets; set DM_NVN_ROP_ROUND=1 for games needing exact NVIDIA half-step flags (e.g. Sonic Frontiers)
+#else
+        v = !(e && !strcmp(e, "0"));
+#endif
+        if (!v) MLOG("DM_NVN_ROP_ROUND=0: colours go into normalized targets as Apple's GPU converts them");
+    }
+    return v;
+}
 static uint32_t rop_class(MTLPixelFormat f) {
     switch (f) {
         case MTLPixelFormatR8Unorm: case MTLPixelFormatRG8Unorm: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatBGRA8Unorm: return DMSH_ROUND_8;
@@ -10853,11 +10882,47 @@ static void pso_fixed4(MTL4RenderPipelineDescriptor *m, MTLRenderPipelineDescrip
     m.rasterizationEnabled = d.rasterizationEnabled; m.inputPrimitiveTopology = d.inputPrimitiveTopology;
     if (d.maxVertexAmplificationCount > 1) m.maxVertexAmplificationCount = d.maxVertexAmplificationCount;
 }
+// Whether a pipeline descriptor can produce a non-zero dm_blend_state word (bz_word or rop_word): when 0, the fragment shader is specialized with dm_blend_off=true (DMSH_BLEND_FC),
+// allowing Metal to dead-code-eliminate dm_bz, dm_rop and the dm_blend constant buffer fetch from every pixel.
+static int d_blend_need(MTLRenderPipelineDescriptor *d) {
+    if (!d) return 0;
+    int bz = bz_on(), rop = rop_on();
+    if (!bz && !rop) return 0;
+    for (int i = 0; i < 8; i++) {
+        MTLRenderPipelineColorAttachmentDescriptor *a = d.colorAttachments[i];
+        MTLPixelFormat pf = a.pixelFormat;
+        if (!pf) continue;
+        if (bz && a.blendingEnabled && pf_is_float(pf)) {
+            MTLBlendOperation op = a.rgbBlendOperation;
+            if (op != MTLBlendOperationMin && op != MTLBlendOperationMax) {
+                MTLBlendFactor df = a.destinationRGBBlendFactor, sf = a.sourceRGBBlendFactor;
+                if (df != MTLBlendFactorSourceColor && df != MTLBlendFactorOneMinusSourceColor &&
+                    df != MTLBlendFactorSource1Color && df != MTLBlendFactorOneMinusSource1Color &&
+                    df != MTLBlendFactorSource1Alpha && df != MTLBlendFactorOneMinusSource1Alpha &&
+                    (sf == MTLBlendFactorSourceAlpha || sf == MTLBlendFactorOneMinusSourceAlpha)) return 1;
+            }
+        }
+        if (rop && rop_class(pf)) {
+            if (!a.blendingEnabled) return 1;
+            MTLBlendOperation ro = a.rgbBlendOperation, ao = a.alphaBlendOperation;
+            if ((ro == MTLBlendOperationMin || ro == MTLBlendOperationMax) &&
+                (ao == MTLBlendOperationMin || ao == MTLBlendOperationMax)) return 1;
+        }
+    }
+    return 0;
+}
+static inline int pso_off_mask(MTLRenderPipelineDescriptor *d, int off) {
+    int m = (off & 1) ? 1 : 0;
+    if (off & 2) m |= 2;
+    else if (d && !d_blend_need(d)) m |= 2;
+    return m;
+}
 // pso_desc's descriptor as a Metal 4 one: unspec leaves every colour attachment unspecialized (the base), else copies them. nil when a function has no Metal 4 descriptor (fn4_of)
-static MTL4RenderPipelineDescriptor *pso_desc4(MTLRenderPipelineDescriptor *d, int unspec, int off) {   // off: without the border corrections (fn4_of_b)
+static MTL4RenderPipelineDescriptor *pso_desc4(MTLRenderPipelineDescriptor *d, int unspec, int off) {   // off: bit 0 border off (!k.border), bit 1 blend/ROP off (computed from d when omitted)
     // Metal 4 requires a fragment function when rasterization is enabled. Depth-only draws still need rasterization.
     if (d.rasterizationEnabled && !d.fragmentFunction) return nil;
-    MTL4FunctionDescriptor *vf = fn4_of_b(d.vertexFunction, off), *ff = d.fragmentFunction ? fn4_of_b(d.fragmentFunction, off) : nil;
+    int mask = pso_off_mask(d, off);
+    MTL4FunctionDescriptor *vf = fn4_of_b(d.vertexFunction, mask), *ff = d.fragmentFunction ? fn4_of_b(d.fragmentFunction, mask) : nil;
     if (!vf || (d.fragmentFunction && !ff)) return nil;
     MTL4RenderPipelineDescriptor *m = [MTL4RenderPipelineDescriptor new];
     m.vertexFunctionDescriptor = vf; m.fragmentFunctionDescriptor = ff; m.vertexDescriptor = d.vertexDescriptor;
@@ -10872,7 +10937,7 @@ static MTL4RenderPipelineDescriptor *pso_desc4(MTLRenderPipelineDescriptor *d, i
     return m;
 }
 static void pbase_key_of(MTLRenderPipelineDescriptor *d, int off, pbase_key *k) {
-    memset(k, 0, sizeof *k); k->off = off != 0;
+    memset(k, 0, sizeof *k); k->off = (uint32_t)pso_off_mask(d, off);
     k->vf = (__bridge const void *)d.vertexFunction; k->ff = (__bridge const void *)d.fragmentFunction;
     k->samples = (uint32_t)d.rasterSampleCount; k->a2c = d.alphaToCoverageEnabled; k->rast = d.rasterizationEnabled; k->topo = (uint32_t)d.inputPrimitiveTopology; k->amp = (uint32_t)d.maxVertexAmplificationCount;
     MTLVertexDescriptor *vd = d.vertexDescriptor;
@@ -10884,7 +10949,8 @@ static void pbase_key_of(MTLRenderPipelineDescriptor *d, int off, pbase_key *k) 
 }
 // A pipeline with no Metal 4 descriptor, through the MTLDevice: from specialized functions (fn_dev_b)
 static id<MTLRenderPipelineState> pso_build_dev(MTLRenderPipelineDescriptor *d, int off, NSError **e) {
-    id<MTLFunction> vf = fn_dev_b(d.vertexFunction, off), ff = fn_dev_b(d.fragmentFunction, off);
+    int mask = pso_off_mask(d, off);
+    id<MTLFunction> vf = fn_dev_b(d.vertexFunction, mask), ff = fn_dev_b(d.fragmentFunction, mask);
     if (vf == d.vertexFunction && ff == d.fragmentFunction) return dev_rps(d, e);
     MTLRenderPipelineDescriptor *dd = [d copy]; dd.vertexFunction = vf; dd.fragmentFunction = ff;
     return dev_rps(dd, e);
@@ -11334,12 +11400,14 @@ static NSDictionary<NSString *, NSString *> *pre_fail_load(NSString *path, NSStr
     if ([head isEqualToString:pre_fail_head(want)]) return pairs;
     *other = 1; return @{};
 }
-static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   // the common draw's specialization: defaults, with unused border corrections off (as fn_off's)
+static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   // the common draw's specialization: defaults, with unused border and blend/ROP fixups off (as fn_off_m's)
     id<MTLFunction> f = [lib newFunctionWithName:name]; if (!f) return nil;
     MTL4LibraryFunctionDescriptor *ld = [MTL4LibraryFunctionDescriptor new]; ld.library = lib; ld.name = name;
     if (!f.functionConstantsDictionary.count) return ld;
     MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
-    if (f.functionConstantsDictionary[@"dm_border_off"]) { BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC]; }
+    BOOL yes = YES;
+    if (f.functionConstantsDictionary[@"dm_border_off"]) [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC];
+    if (f.functionConstantsDictionary[@"dm_blend_off"]) [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BLEND_FC];
     MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = cv; return sd;
 }
 static NSDictionary *pre_json(NSString *key) { NSData *d = msl_data([NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]); return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }

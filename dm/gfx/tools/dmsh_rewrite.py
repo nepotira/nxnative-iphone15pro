@@ -912,6 +912,8 @@ def frag_z_snap(msl):
 # the G-buffer leaves black. Here the colour becomes rint(float32(saturate(c) * scale)) / scale, which Apple's conversion stores as that integer. Only where the stored value is the
 # conversion of the shader's colour: blending off, MIN or MAX (they pick one of two stored values) or a logic operation; a blended sum is rounded after the blend, which a shader cannot reach.
 BLEND_ZERO = '''struct dm_blend_state { uint zero; uint round; };   // see dmsh_rewrite.py blend_zero
+constant bool dm_blend_off [[function_constant(%du)]];
+constant bool dm_blend_live = !is_function_constant_defined(dm_blend_off) || !dm_blend_off;
 static inline __attribute__((always_inline)) float4 dm_bz(float4 c, uint m)
 {
     m &= %du;
@@ -927,6 +929,7 @@ static inline __attribute__((always_inline)) float4 dm_rop(float4 c, uint m)
 }
 static inline __attribute__((always_inline)) void dm_blend0(thread main0_out& dm_o, constant dm_blend_state& dm_s)
 {
+    if (!dm_blend_live) return;
     uint m = dm_s.zero, r = dm_s.round;
     if ((m | r) == 0u) return;
 %s}
@@ -948,6 +951,6 @@ def blend_zero(msl):
     body, k = re.subn(r'^([ \t]*)return out;$', lambda m: f'{m.group(1)}dm_blend0(out, dm_blend);\n{m.group(1)}return out;', body, flags=re.M)
     if not k or k != n: return msl, 0
     bits, rb = abi.BLEND_ZERO_BITS, abi.BLEND_ROUND_BITS
-    helper = BLEND_ZERO % ((1 << bits) - 1, (1 << rb) - 1, abi.ROUND_8, abi.ROUND_16,
+    helper = BLEND_ZERO % (abi.BLEND_FC, (1 << bits) - 1, (1 << rb) - 1, abi.ROUND_8, abi.ROUND_16,
                            ''.join(f'    dm_o.{nm} = dm_rop(dm_bz(dm_o.{nm}, m >> {bits * c}u), r >> {rb * c}u);\n' for nm, c in cols))
     return msl[:e['start']] + helper + '\n' + msl[e['start']:e['head'] - 1] + (', ' if e['params'] else '') + BLEND_ZERO_PARAM + ')' + body + msl[e['end']:], k
