@@ -1711,6 +1711,7 @@ static void pass_split_try(void);
 static uint64_t g_setrt_n;   // render target changes so far (pass_split_try: splits per NVN pass)
 static int g_split_resume;   // the pass was split at this draw: it opens again where the dispatch scan already looked (cs_hoist_try)
 __attribute__((weak)) extern void nvn_queue_pool_trim(int drop_all);
+static unsigned arena_trim(uint64_t idle);
 static _Atomic int g_mtl_thermal_state = -1;
 static int thermal_proactive_mtl(void);
 static void mem_governor_tick(void) {
@@ -1743,6 +1744,7 @@ static void mem_governor_tick(void) {
     }
     if (tier >= 2) {
         if (nvn_queue_pool_trim) nvn_queue_pool_trim(tier >= 3);
+        (void)arena_trim(tier >= 3 ? 2u : 30u);
         uint64_t freed_bytes = 0;
         pthread_mutex_lock(&g_smu);
         uint32_t dropped = own_alias_trim_unheld_locked(tier >= 3 ? 60u : 300u, tier >= 3 ? 256u : 64u, &freed_bytes);
@@ -3397,6 +3399,22 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
             d.compressionType = MTLTextureCompressionTypeLossy;
         }
     }
+#if TARGET_OS_IPHONE
+    // Optional TBDR memoryless MSAA color targets (DM_NVN_MSAA_MEMORYLESS=1/ab): allocates 0 bytes of DRAM for GPU-only MSAA targets not registered for sampling;
+    // any subsequent load, unfused copy, or shader sample automatically materializes the texture to MTLStorageModePrivate via tex_upgrade().
+    static int msaa_ml_mode = -1;
+    if (msaa_ml_mode < 0) msaa_ml_mode = sw_mode("DM_NVN_MSAA_MEMORYLESS", 0);
+    if (msaa_ml_mode && sw_on(msaa_ml_mode) && !packaged
+        && (d.usage & MTLTextureUsageRenderTarget)
+        && !(d.usage & (MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite))
+        && d.textureType == MTLTextureType2DMultisample && d.sampleCount > 1 && d.mipmapLevelCount == 1
+        && !fmt_int_or_ds(d.pixelFormat)
+        && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)
+        && !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))) {
+        d.storageMode = MTLStorageModeMemoryless;
+        d.usage = MTLTextureUsageRenderTarget;
+    }
+#endif
     return d;
 }
 // A level's size as its Metal texture holds it (tex_desc): width, rows, and depth planes (z may be NULL). A 1D (target 0) or 1D array (3) texture is one row; a 1D array's NVN
@@ -3420,8 +3438,10 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = base.textureType; d.pixelFormat = base.pixelFormat; d.width = base.width; d.height = base.height; d.depth = base.depth;   // Keep the original format, only add the format-view usage
     d.arrayLength = base.arrayLength; d.mipmapLevelCount = base.mipmapLevelCount; d.sampleCount = base.sampleCount;
-    d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
-    d.resourceOptions = base.resourceOptions; d.usage = base.usage | add | (tex_atomic_capable(base) ? MTLTextureUsageShaderAtomic : 0);   // the usage property leaves the atomic usage out
+    int was_ml = base.storageMode == MTLStorageModeMemoryless;
+    d.storageMode = was_ml ? MTLStorageModePrivate : base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
+    d.resourceOptions = was_ml ? ((base.resourceOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModePrivate) : base.resourceOptions;
+    d.usage = base.usage | add | (tex_atomic_capable(base) ? MTLTextureUsageShaderAtomic : 0);   // the usage property leaves the atomic usage out
     // A linear texture aliases the guest pool. Adding usage must keep that backing: a new standalone texture copies the old pixels once, but later GPU writes never reach the CPU map.
     id<MTLBuffer> backing = base.buffer;
     int reinterpret = (add & MTLTextureUsageShaderAtomic) && !pf_atomic(base.pixelFormat);   // an RG32Uint texture takes 64-bit atomics as it is (pf_atomic)
@@ -3436,9 +3456,9 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
     if (!upgraded) { RED_ONCE(45, "texture upgrade failed ser=%llu format %lu → %lu usage %#lx", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, (unsigned long)d.usage); return base; }
     if (!reinterpret) res_add(upgraded);
     id<MTLTexture> upgraded_view = nil;
-    id<MTL4ComputeCommandEncoder> b = backing ? nil : blit();   // shared backing already contains the pixels; copying it onto itself would overlap
+    id<MTL4ComputeCommandEncoder> b = (backing || was_ml) ? nil : blit();   // shared backing already contains the pixels; memoryless textures have no DRAM backing to copy
     NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
-    for (NSUInteger l = 0; !backing && l < base.mipmapLevelCount; l++) {
+    for (NSUInteger l = 0; !backing && !was_ml && l < base.mipmapLevelCount; l++) {
         NSUInteger w = MAX(base.width >> l, 1u), h = MAX(base.height >> l, 1u), z = base.textureType == MTLTextureType3D ? MAX(base.depth >> l, 1u) : 1;
         if (base.textureType == MTLTextureType3D)
             enc_b_copy_texture(b, base, 0, l, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, z), upgraded, 0, l, MTLOriginMake(0, 0, 0));
@@ -3540,6 +3560,7 @@ static void up_idle_drop(__strong id<MTLBuffer> *block) {
     g_up_idle_n++;
     g_up_idle_bytes += (*block).length;
     res_remove(*block);
+    [*block setPurgeableState:MTLPurgeableStateEmpty];
     *block = nil;
 }
 
@@ -5909,7 +5930,7 @@ void ts_after(void);
 void ms_after(void);
 // ---------- Attachment stores: at pass end, an attachment this pass did not change is not written back ----------
 // On TBDR every attachment is written back to memory in full when the pass ends; Switch (Maxwell immediate-mode rendering) has no such cost.
-typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy, img, rast, resolve; const tex_t *tex; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth; resolve: MSAA fused into this pass
+typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy, img, rast, resolve, memoryless; const tex_t *tex; const char *wkey; int wslot; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth; resolve: MSAA fused into this pass; memoryless: MTLStorageModeMemoryless target
 // Depth and stencil have independent store decisions, even in one combined texture.
 // Eight color targets therefore need ten records (XC2 uses the full set).
 enum { SD_ATT_MAX = 8 + 2 };
@@ -6439,6 +6460,11 @@ static void *rp_begin_ex_(int clear_only) {
         if (rt_dup_slot(&R.rt, i)) continue;   // a slot attached twice is not attached (see rt_dup_slot)
         attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
         if (!pd.colorAttachments[i].texture) continue;
+        if (!R.clear_c[i] && pd.colorAttachments[i].texture.storageMode == MTLStorageModeMemoryless) {
+            (void)tex_upgrade(R.rt.color[i], pd.colorAttachments[i].texture, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, pd.colorAttachments[i].texture.pixelFormat);
+            attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
+            if (!pd.colorAttachments[i].texture) continue;
+        }
         any = 1;
         pd.colorAttachments[i].loadAction = R.clear_c[i] ? MTLLoadActionClear : MTLLoadActionLoad;
         pd.colorAttachments[i].clearColor = R.cc[i];
@@ -6581,7 +6607,7 @@ static void *rp_begin_ex_(int clear_only) {
     {
         // A standalone clear has already stored before this pass; only a clear load action here writes this pass's tiles.
         for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture || bcrt_is(c.texture)) continue;
-            g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].tex = R.rt.color[i]; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_sd[g_nsd].rast = c.loadAction == MTLLoadActionClear; g_nsd++;
+            g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].tex = R.rt.color[i]; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_sd[g_nsd].rast = c.loadAction == MTLLoadActionClear; g_sd[g_nsd].memoryless = c.texture.storageMode == MTLStorageModeMemoryless; g_nsd++;
             c.storeAction = MTLStoreActionUnknown; }
         id<MTLTexture> dt = pd.depthAttachment.texture, stt = pd.stencilAttachment.texture;
         uint64_t db = att_bytes(dt, pd.depthAttachment.level), sb = 0;
@@ -7952,6 +7978,7 @@ static void *tex_by_id_ref(int tid) {
     }
     treg_t r = *rp;
     id<MTLTexture> base = treg_tex(rp);
+    if (base && base.storageMode == MTLStorageModeMemoryless) base = tex_upgrade(&r.t, base, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, base.pixelFormat);
     if (!base) { if (rp->gone) { static uint64_t n; if (n++ < 4) MLOG("texture ID %d read after its memory pool was finalized ser=%llu %ux%u format %#x: treated as an empty slot (%llu so far)", tid, (unsigned long long)rp->t.serial, rp->t.d.width, rp->t.d.height, rp->t.d.format, (unsigned long long)n); } return NULL; }
     v = base;
     // Channel swizzle: the view's if set, otherwise the one from texture building; identity builds no view (SMBW's font cache is (1 1 1 R): without the swizzle glyphs become white blocks).
@@ -8337,7 +8364,7 @@ static unsigned arena_trim(uint64_t idle) {
         int big = a->len > ARENA_KEEP;
         if (!big && (!trim || usual <= ARENA_KEEP_BLOCKS)) continue;
         if (a == g_arena_next) g_arena_next = nil;
-        res_remove(a->buf); g_arena_live--; g_arena_live_bytes -= a->len; n++;
+        res_remove(a->buf); [a->buf setPurgeableState:MTLPurgeableStateEmpty]; g_arena_live--; g_arena_live_bytes -= a->len; n++;
         g_arena_freed++; g_arena_freed_bytes += a->len; if (!big) usual--;
         [g_arenas removeObjectAtIndex:i];
     }
@@ -14212,8 +14239,9 @@ static void sd_finish(void) {
         int img_dead = t->depth == 0 && t->load && t->img && !t->rast;
         int tdc_dead = !udc_dead && !img_dead && !t->resolve && (t->depth == 1 || t->depth == 2) && transient_dc_on() && sd_transient_dead(t);
         int dead = udc_dead || img_dead || tdc_dead;
-        MTLStoreAction sa = t->resolve ? ((msaa_opt_on() || dead) ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve)
-                                       : (dead ? MTLStoreActionDontCare : MTLStoreActionStore);
+        MTLStoreAction sa = t->memoryless ? (t->resolve ? MTLStoreActionMultisampleResolve : MTLStoreActionDontCare)
+                                          : t->resolve ? ((msaa_opt_on() || dead) ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve)
+                                          : (dead ? MTLStoreActionDontCare : MTLStoreActionStore);
         if (t->depth == 1) [g_enc setDepthStoreAction:sa]; else if (t->depth == 2) [g_enc setStencilStoreAction:sa]; else [g_enc setColorStoreAction:sa atIndex:(NSUInteger)t->idx];
         g_sd_n_all++;
         if (dead && !t->resolve) { g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes; if (udc_dead) g_udc_saved_bytes += t->bytes; if (tdc_dead) { g_tdc_n++; g_tdc_saved_bytes += t->bytes; PD("Z %llu transient depth/stencil elided (count=%llu saved=%.1fMB)", g_stat_pass, (unsigned long long)g_tdc_n, (double)g_tdc_saved_bytes / (1024.0 * 1024.0)); } }
@@ -17649,6 +17677,7 @@ static int bc_alias_copy(const p_copy_t2t *c, id<MTLTexture> s, unsigned sl, uns
 static id<MTLTexture> copy_t2t_enc(const p_copy_t2t *c) {
     rp_flush();   // Land the pending pure-clear render pass first; the blit() below would end the render pass anyway
     id<MTLTexture> s = tex_mtl_all(c->src);
+    if (s && s.storageMode == MTLStorageModeMemoryless) s = tex_upgrade(c->src, s, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, s.pixelFormat);
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
     if (!s || !c->dst) return nil;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
@@ -17656,6 +17685,7 @@ static id<MTLTexture> copy_t2t_enc(const p_copy_t2t *c) {
     if (!tex_level_ok(s, sl, "texture copy source")) return nil;
     if (bc_alias_copy(c, s, sl, sz0, dl, dz0)) return nil;   // the destination aliases a compressed texture: the bytes go there, and the alias's own texture is not made (see bc_alias_copy)
     id<MTLTexture> d = tex_mtl_all(c->dst); sparse_gpu_wrote(c->dst); tu_wrote(d);
+    if (d && d.storageMode == MTLStorageModeMemoryless) d = tex_upgrade(c->dst, d, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, d.pixelFormat);
     if (!d || !tex_level_ok(d, dl, "texture copy destination")) return nil;
     { tex_t pair; bcp_before(c->dst, d, &pair); }   // a side of a compressed-alias pair: filled first, the copied region goes into its other side after (copy_t2t)
     if (c->flags & DM_COPY_RESOLVE) {   // Downsample: multisample resolve into the single-sample destination (depth takes sample 0); with equal sample counts it is a plain whole copy
