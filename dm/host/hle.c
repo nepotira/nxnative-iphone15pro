@@ -94,17 +94,28 @@ int gate_obs_present(int id) { return id > 0 && id < OBS_MAX && g_obs_have[id]; 
 typedef struct { uint64_t ret; int kind, arg; uint64_t orig; } gate_t;
 #define GATE_BITS 15                     // 32768 slots, gate count ≤ 8192, load factor ≤ 1/4 (spin wait gates: Tears of the Kingdom's main has 843)
 static gate_t g_gate[1u << GATE_BITS];
+// Direct-mapped fast table read by entry.S _dm_gate for mrs xN, cntpct_el0 / cntvct_el0 (skips 32 NEON spills and fpcr/fpsr pipeline flush).
+struct { uint64_t ret, reg; } dm_fast_cntpct[1u << GATE_BITS];
 static int g_ngate;
 static inline unsigned gate_h(uint64_t a) { return (unsigned)(((a >> 2) * 0x9E3779B97F4A7C15ull) >> (64 - GATE_BITS)); }
+
+uint64_t dm_cntpct_fast(void) {
+    guest_clock_read_wait();
+    return guest_ticks();
+}
 
 void gate_register(uint64_t ret_abs, const char *kind, int arg, uint64_t orig) {
     int k = !strcmp(kind, "svc") ? G_SVC : !strcmp(kind, "cntpct") ? G_CNTPCT : !strcmp(kind, "cntvct") ? G_CNTVCT : !strcmp(kind, "obs") ? G_OBS : !strcmp(kind, "spin") ? G_SPIN : -1;
     if (k < 0) die("unknown gate kind %s", kind);
     if (k == G_OBS) { if ((arg & 0xff) <= 0 || (arg & 0xff) >= OBS_MAX) die("observation gate number out of range %d", arg & 0xff); g_obs_have[arg & 0xff] = 1; }
     if (++g_ngate > (1 << GATE_BITS) / 4) die("gate overflow");
-    unsigned i = gate_h(ret_abs);
+    unsigned h = gate_h(ret_abs), i = h;
     while (g_gate[i].ret) { if (g_gate[i].ret == ret_abs) die("gate registered twice %#llx", ret_abs); i = (i + 1) & ((1u << GATE_BITS) - 1); }
     g_gate[i] = (gate_t){ret_abs, k, arg, orig};
+    if ((k == G_CNTPCT || k == G_CNTVCT) && arg >= 0 && arg <= 28 && arg != 18 && !dm_fast_cntpct[h].ret) {
+        dm_fast_cntpct[h].ret = ret_abs;
+        dm_fast_cntpct[h].reg = (uint64_t)arg;
+    }
 }
 
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr);   // hle_svc.c

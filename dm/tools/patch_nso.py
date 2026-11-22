@@ -346,15 +346,38 @@ def sp_delta(ins):
     assert not re.match(r'(sp|wsp),', ins.op_str), f'writes sp: {ins.address:x} {ins.op_str}'
     return 0
 
+PURE_READ_NO_GPR_WRITE = frozenset(
+    'str strb strh stur sturb sturh stp stnp stlr stlrb stlrh cmp cmn tst ccmp ccmn cbz cbnz tbz tbnz'.split()
+)
+PURE_READ_SINGLE_DST = frozenset(
+    'add adds sub subs and ands orr orn eor eon bic bics mov madd msub mul udiv sdiv lsl lsr asr ror '
+    'csel csinc csinv csneg bfm sbfm ubfm extr ldr ldrb ldrh ldrsb ldrsh ldrsw ldur ldurb ldurh ldursb ldursh ldursw'.split()
+)
+def x18_is_pure_read(ins):
+    """Conservative ISA-level proof that ins cannot modify x18/w18 (does not rely on Capstone's regs_access write set)."""
+    if ins.writeback or '!' in ins.op_str or '],' in ins.op_str:
+        return False
+    m = ins.mnemonic
+    if m in PURE_READ_NO_GPR_WRITE:
+        return True
+    if m in PURE_READ_SINGLE_DST:
+        w = struct.unpack('<I', ins.bytes)[0]
+        return (w & 31) != 18
+    return False
+
 def site_plain(ins):
     S, T = pick(regs_in(ins))
     dlt = sp_delta(ins)
     save = -16 if dlt == 0 else -112          # Instructions that modify sp write below sp, so the scratch save is placed deep in the reserved area
     assert dlt == 0 or dlt >= -96, f'sp delta {dlt} at {ins.address:x}'
+    pure_read = x18_is_pure_read(ins)
     start = here()
     emit(STP(S, T, 31, save)); emit(MRS_TPIDRRO(T)); emit_slot_addr(T, S, 'K18'); emit(LDRX(S, T))
     emit(subst(ins, S))
-    emit(STRX(S, T))                 # Always write back: capstone can miss reporting a write (the adds w18 instance)
+    if not pure_read:
+        emit(STRX(S, T))                 # Write back whenever x18 may have been modified
+    else:
+        stat('x18_read_only')
     emit(LDP(S, T, 31, save - dlt)); emit(BX(here(), ins.address + 4))
     return start
 
@@ -554,9 +577,13 @@ def site_slot_copy(ins, src, dst):
     The Apple kernel may change x18 at any instruction, so the value never passes through it: x15 carries it, and x16 / x17 form the slot addresses, all three saved in the red zone"""
     start = here()
     emit(STP(16, 17, 31, -16)); emit(STUR(15, 31, -24))
-    if isinstance(src, str): emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, src); emit(LDRX(15, 16))
-    else: emit(src)
-    emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, dst); emit(STRX(15, 16))
+    if isinstance(src, str):
+        emit(MRS_TPIDRRO(16))
+        emit_key_addr(17, src); emit(ADDR(17, 16, 17)); emit(LDRX(15, 17))
+        emit_slot_addr(16, 17, dst); emit(STRX(15, 16))
+    else:
+        emit(src)
+        emit(MRS_TPIDRRO(16)); emit_slot_addr(16, 17, dst); emit(STRX(15, 16))
     emit(LDUR(15, 31, -24)); emit(LDP(16, 17, 31, -16))
     emit(BX(here(), ins.address + 4))
     return start
@@ -1849,6 +1876,48 @@ spin_sites = [(g['T'], sorted(g['valid']), sum(len(g['nodes'][a]['ins']) for a i
 for g in spin_regions: spin_emit(g)
 if os.environ.get('DM_SPIN_LIST'):
     for T, bes, n in spin_sites: print(f'{NAME} spin wait {T:#x} ({n} instructions), back-edges ' + ' '.join(f'{b:#x}' for b in bes))
+
+# ARMv8.1 LSE lowering for non-spin 4-instruction LL/SC add/sub loops:
+#   ldaxr rA, [xN]; add/sub rB, rA, #imm12; stlxr wS, rB, [xN]; cbnz wS, -12
+# becomes in-place (4 words -> 4 words, exact register/flag/memory post-state):
+#   mov/movn rS, #±imm12; ldaddal rS, rA, [xN]; add/sub rB, rA, #imm12; mov wS, wzr
+if os.environ.get('DM_REWRITE_LSE', '1') != '0':
+    lse_blocked = spin_touched | {a for g in spin_regions for a in g['R']}
+    lse_n = 0
+    for s, e in CODE_RANGES:
+        o = s
+        while o + 16 <= e:
+            w0, w1, w2, w3 = struct.unpack_from('<4I', IMG, o)
+            # ldaxr wA/xA, [xN]: size in bit 30 (0=32b, 1=64b), fixed bits 0x885FFC00
+            if (w0 & 0xBFFFFC00) == 0x885FFC00 and all((o + 4 * k) not in lse_blocked for k in range(4)):
+                is64 = (w0 >> 30) & 1
+                ra, rn = w0 & 31, (w0 >> 5) & 31
+                # add/sub (immediate, no flags, shift=0): op in bit 30 (0=add, 1=sub), sf in bit 31 == is64
+                if ((w1 >> 31) & 1) == is64 and (w1 & 0x3FC00000) == 0x11000000:
+                    is_sub = (w1 >> 30) & 1
+                    imm12 = (w1 >> 10) & 0xFFF
+                    rb, r1_rn = w1 & 31, (w1 >> 5) & 31
+                    # stlxr wS, rB, [xN]: size in bit 30 == is64, fixed bits 0x8800FC00
+                    if imm12 > 0 and r1_rn == ra and (w2 & 0xBFE0FC00) == 0x8800FC00 and ((w2 >> 30) & 1) == is64:
+                        rs = (w2 >> 16) & 31
+                        r2_rt, r2_rn = w2 & 31, (w2 >> 5) & 31
+                        want_cbnz = 0x35000000 | (((-3) & 0x7FFFF) << 5) | rs
+                        if (r2_rt == rb and r2_rn == rn and w3 == want_cbnz
+                                and all(r not in (18, 31) for r in (ra, rb, rs))
+                                and rn != 18 and rs not in (ra, rb, rn)):
+                            if is64:
+                                m_ins = MOVN64(rs, imm12 - 1) if is_sub else MOVZ64(rs, imm12)
+                                l_ins = LDADDAL64(rs, ra, rn)
+                            else:
+                                m_ins = MOVN32(rs, imm12 - 1) if is_sub else MOVZ32(rs, imm12)
+                                l_ins = LDADDAL32(rs, ra, rn)
+                            struct.pack_into('<4I', IMG, o, m_ins, l_ins, w1, MOVW_ZR(rs))
+                            lse_n += 1
+                            o += 16
+                            continue
+            o += 4
+    if lse_n:
+        stats['lse_lowered'] = lse_n
 
 os.makedirs(outdir, exist_ok=True)
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
