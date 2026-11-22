@@ -1877,41 +1877,80 @@ for g in spin_regions: spin_emit(g)
 if os.environ.get('DM_SPIN_LIST'):
     for T, bes, n in spin_sites: print(f'{NAME} spin wait {T:#x} ({n} instructions), back-edges ' + ' '.join(f'{b:#x}' for b in bes))
 
-# ARMv8.1 LSE lowering for non-spin 4-instruction LL/SC add/sub loops:
-#   ldaxr rA, [xN]; add/sub rB, rA, #imm12; stlxr wS, rB, [xN]; cbnz wS, -12
-# becomes in-place (4 words -> 4 words, exact register/flag/memory post-state):
-#   mov/movn rS, #±imm12; ldaddal rS, rA, [xN]; add/sub rB, rA, #imm12; mov wS, wzr
+# ARMv8.1 LSE lowering for non-spin LL/SC atomic loops (in-place, exact register/flag/memory post-state):
+#   1) 3-word exchange: ldaxr rA, [xN]; stlxr wS, rM, [xN]; cbnz wS, -8
+#      -> swpal rM, rA, [xN]; mov wS, wzr; nop
+#   2) 4-word imm add/sub: ldaxr rA, [xN]; add/sub rB, rA, #imm12; stlxr wS, rB, [xN]; cbnz wS, -12
+#      -> mov/movn rS, #±imm12; ldaddal rS, rA, [xN]; add/sub rB, rA, #imm12; mov wS, wzr
+#   3) 4-word reg add/orr/eor/bic: ldaxr rA, [xN]; op rB, rA, rM; stlxr wS, rB, [xN]; cbnz wS, -12
+#      -> ld{add,set,eor,clr}al rM, rA, [xN]; op rB, rA, rM; mov wS, wzr; nop
 if os.environ.get('DM_REWRITE_LSE', '1') != '0':
     lse_blocked = spin_touched | {a for g in spin_regions for a in g['R']}
     lse_n = 0
+    _LSE_REG_OPS = {
+        0x0B000000: (LDADDAL32, LDADDAL64, True),    # add (shifted reg, imm6=0)
+        0x2A000000: (LDSETAL32, LDSETAL64, True),    # orr (shifted reg, imm6=0)
+        0x4A000000: (LDEORAL32, LDEORAL64, True),    # eor (shifted reg, imm6=0)
+        0x0A200000: (LDCLRAL32, LDCLRAL64, False),   # bic (shifted reg, imm6=0; non-commutative)
+    }
     for s, e in CODE_RANGES:
         o = s
-        while o + 16 <= e:
-            w0, w1, w2, w3 = struct.unpack_from('<4I', IMG, o)
+        while o + 12 <= e:
+            w0, w1, w2 = struct.unpack_from('<3I', IMG, o)
             # ldaxr wA/xA, [xN]: size in bit 30 (0=32b, 1=64b), fixed bits 0x885FFC00
-            if (w0 & 0xBFFFFC00) == 0x885FFC00 and all((o + 4 * k) not in lse_blocked for k in range(4)):
+            if (w0 & 0xBFFFFC00) == 0x885FFC00 and all((o + 4 * k) not in lse_blocked for k in range(3)):
                 is64 = (w0 >> 30) & 1
                 ra, rn = w0 & 31, (w0 >> 5) & 31
-                # add/sub (immediate, no flags, shift=0): op in bit 30 (0=add, 1=sub), sf in bit 31 == is64
-                if ((w1 >> 31) & 1) == is64 and (w1 & 0x3FC00000) == 0x11000000:
-                    is_sub = (w1 >> 30) & 1
-                    imm12 = (w1 >> 10) & 0xFFF
-                    rb, r1_rn = w1 & 31, (w1 >> 5) & 31
-                    # stlxr wS, rB, [xN]: size in bit 30 == is64, fixed bits 0x8800FC00
-                    if imm12 > 0 and r1_rn == ra and (w2 & 0xBFE0FC00) == 0x8800FC00 and ((w2 >> 30) & 1) == is64:
+                # Pattern 1: 3-word atomic exchange (swpal)
+                if (w1 & 0xBFE0FC00) == 0x8800FC00 and ((w1 >> 30) & 1) == is64:
+                    rs = (w1 >> 16) & 31
+                    rm, r1_rn = w1 & 31, (w1 >> 5) & 31
+                    want_cbnz2 = 0x35000000 | (((-2) & 0x7FFFF) << 5) | rs
+                    if (r1_rn == rn and w2 == want_cbnz2 and ra != 18 and rm != 18 and rn != 18
+                            and rs not in (18, 31) and rs not in (ra, rm, rn) and rm != ra and ra != rn):
+                        swp = SWPAL64(rm, ra, rn) if is64 else SWPAL32(rm, ra, rn)
+                        struct.pack_into('<3I', IMG, o, swp, MOVW_ZR(rs), NOP)
+                        lse_n += 1
+                        o += 12
+                        continue
+                if o + 16 <= e and (o + 12) not in lse_blocked:
+                    w3 = struct.unpack_from('<I', IMG, o + 12)[0]
+                    # Pattern 2: 4-word imm add/sub (ldaddal)
+                    if ((w1 >> 31) & 1) == is64 and (w1 & 0x3FC00000) == 0x11000000:
+                        is_sub = (w1 >> 30) & 1
+                        imm12 = (w1 >> 10) & 0xFFF
+                        rb, r1_rn = w1 & 31, (w1 >> 5) & 31
+                        if imm12 > 0 and r1_rn == ra and (w2 & 0xBFE0FC00) == 0x8800FC00 and ((w2 >> 30) & 1) == is64:
+                            rs = (w2 >> 16) & 31
+                            r2_rt, r2_rn = w2 & 31, (w2 >> 5) & 31
+                            want_cbnz = 0x35000000 | (((-3) & 0x7FFFF) << 5) | rs
+                            if (r2_rt == rb and r2_rn == rn and w3 == want_cbnz
+                                    and all(r not in (18, 31) for r in (ra, rb, rs))
+                                    and rn != 18 and rs not in (ra, rb, rn)):
+                                if is64:
+                                    m_ins = MOVN64(rs, imm12 - 1) if is_sub else MOVZ64(rs, imm12)
+                                    l_ins = LDADDAL64(rs, ra, rn)
+                                else:
+                                    m_ins = MOVN32(rs, imm12 - 1) if is_sub else MOVZ32(rs, imm12)
+                                    l_ins = LDADDAL32(rs, ra, rn)
+                                struct.pack_into('<4I', IMG, o, m_ins, l_ins, w1, MOVW_ZR(rs))
+                                lse_n += 1
+                                o += 16
+                                continue
+                    # Pattern 3: 4-word reg add/orr/eor/bic (ldaddal/ldsetal/ldeoral/ldclral)
+                    op_entry = _LSE_REG_OPS.get(w1 & 0x7FE0FC00) if ((w1 >> 31) & 1) == is64 else None
+                    if op_entry is not None and (w2 & 0xBFE0FC00) == 0x8800FC00 and ((w2 >> 30) & 1) == is64:
+                        fn32, fn64, comm = op_entry
+                        rb, r1_rn, r1_rm = w1 & 31, (w1 >> 5) & 31, (w1 >> 16) & 31
+                        rm = r1_rm if r1_rn == ra else (r1_rn if comm and r1_rm == ra else -1)
                         rs = (w2 >> 16) & 31
                         r2_rt, r2_rn = w2 & 31, (w2 >> 5) & 31
                         want_cbnz = 0x35000000 | (((-3) & 0x7FFFF) << 5) | rs
-                        if (r2_rt == rb and r2_rn == rn and w3 == want_cbnz
+                        if (rm >= 0 and r2_rt == rb and r2_rn == rn and w3 == want_cbnz
                                 and all(r not in (18, 31) for r in (ra, rb, rs))
-                                and rn != 18 and rs not in (ra, rb, rn)):
-                            if is64:
-                                m_ins = MOVN64(rs, imm12 - 1) if is_sub else MOVZ64(rs, imm12)
-                                l_ins = LDADDAL64(rs, ra, rn)
-                            else:
-                                m_ins = MOVN32(rs, imm12 - 1) if is_sub else MOVZ32(rs, imm12)
-                                l_ins = LDADDAL32(rs, ra, rn)
-                            struct.pack_into('<4I', IMG, o, m_ins, l_ins, w1, MOVW_ZR(rs))
+                                and rm != 18 and rn != 18 and rm != ra and ra != rn and rs not in (ra, rb, rm, rn)):
+                            l_ins = fn64(rm, ra, rn) if is64 else fn32(rm, ra, rn)
+                            struct.pack_into('<4I', IMG, o, l_ins, w1, MOVW_ZR(rs), NOP)
                             lse_n += 1
                             o += 16
                             continue
