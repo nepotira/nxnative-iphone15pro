@@ -1711,6 +1711,8 @@ static void pass_split_try(void);
 static uint64_t g_setrt_n;   // render target changes so far (pass_split_try: splits per NVN pass)
 static int g_split_resume;   // the pass was split at this draw: it opens again where the dispatch scan already looked (cs_hoist_try)
 __attribute__((weak)) extern void nvn_queue_pool_trim(int drop_all);
+static _Atomic int g_mtl_thermal_state = -1;
+static int thermal_proactive_mtl(void);
 static void mem_governor_tick(void) {
     if (!mem_gov_on()) return;
     static uint64_t last_ns;
@@ -1726,6 +1728,7 @@ static void mem_governor_tick(void) {
     int av_tier = avail_mb < 250 ? 3 : (avail_mb < 450 ? 2 : (avail_mb < 800 ? 1 : 0));
     if (av_tier > tier) tier = av_tier;
 #endif
+    if (thermal_proactive_mtl() && atomic_load_explicit(&g_mtl_thermal_state, memory_order_relaxed) >= 2 && tier < 2) tier = 2;
     atomic_store_explicit(&g_mem_tier, tier, memory_order_relaxed);
     if (tier != prev) {
         MLOG("memory governor: tier %d -> %d (headroom %llu MB, os_pressure %d, gpu %llu MB)",
@@ -18950,7 +18953,6 @@ typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; uint64_t ma
 static fx_state g_fx_present;   // only the present thread encodes or replaces the scaler
 static id<MTL4Compiler> g_fx_comp;
 static int g_fx_mode = -1;   // 1 = metalfx, 0 = off
-static _Atomic int g_mtl_thermal_state = -1;
 void mtl_thermal_set(int state) { atomic_store_explicit(&g_mtl_thermal_state, state, memory_order_relaxed); }
 static int thermal_proactive_mtl(void) {
     static int on = -1;
@@ -18971,6 +18973,15 @@ static int fx_mode(void) {
     else if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) v = 0;
     else if (e && *e) MLOG("[RED] DM_PRESENT_UPSCALE=%s: metalfx or off; keeping %s", e, v ? "metalfx" : "off");
     if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("present upscaling: this GPU has no Metal 4 MetalFX spatial scaler; the present scales bilinearly"); v = 0; }
+    {
+        const char *fi = getenv("DM_FRAME_INTERP");
+        if (fi && atoi(fi) != 0) {
+            Class cls = NSClassFromString(@"MTLFXFrameInterpolatorDescriptor");
+            SEL sel = NSSelectorFromString(@"supportsMetal4FX:");
+            BOOL ok = cls && [cls respondsToSelector:sel] && ((BOOL (*)(id, SEL, id))objc_msgSend)(cls, sel, g_dev);
+            MLOG("DM_FRAME_INTERP=1: Metal 4 MetalFX frame interpolator hardware support=%s (experimental probe; dual-frame cadence requires motion vectors + projection matrices)", ok ? "yes" : "no");
+        }
+    }
     MLOG("present upscaling (DM_PRESENT_UPSCALE): %s", v ? "metalfx, MetalFX's spatial scaler where the picture is shown larger than the game renders it" : "off, bilinear");
     return g_fx_mode = v;
 }
