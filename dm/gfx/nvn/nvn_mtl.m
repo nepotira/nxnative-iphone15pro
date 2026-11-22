@@ -1710,6 +1710,7 @@ static void treg_sparse_notes(void);
 static void pass_split_try(void);
 static uint64_t g_setrt_n;   // render target changes so far (pass_split_try: splits per NVN pass)
 static int g_split_resume;   // the pass was split at this draw: it opens again where the dispatch scan already looked (cs_hoist_try)
+__attribute__((weak)) extern void nvn_queue_pool_trim(int drop_all);
 static void mem_governor_tick(void) {
     if (!mem_gov_on()) return;
     static uint64_t last_ns;
@@ -1738,6 +1739,7 @@ static void mem_governor_tick(void) {
         (void)own_ghost_trim_target(keep, idle_f, idle_s, budget);
     }
     if (tier >= 2) {
+        if (nvn_queue_pool_trim) nvn_queue_pool_trim(tier >= 3);
         uint64_t freed_bytes = 0;
         pthread_mutex_lock(&g_smu);
         uint32_t dropped = own_alias_trim_unheld_locked(tier >= 3 ? 60u : 300u, tier >= 3 ? 256u : 64u, &freed_bytes);

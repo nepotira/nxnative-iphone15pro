@@ -23,18 +23,69 @@ typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *
 // Recycled arenas for nq_job (with its nvn_hmap backing) and nq_node command buffers to eliminate per-submission calloc/realloc/free churn.
 enum { NQ_BUF_POOL_MAX = 8, NQ_BUF_POOL_CAP_MAX = 2u << 20, NQ_JOB_POOL_MAX = 16 };
 static pthread_mutex_t nq_pool_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct { uint8_t *bytes; size_t cap; } nq_buf_pool[NQ_BUF_POOL_MAX];
+static struct { uint8_t *bytes; size_t cap; int advised; } nq_buf_pool[NQ_BUF_POOL_MAX];
 static int nq_buf_pool_n;
 static nq_job *nq_job_pool;
 static int nq_job_pool_n;
+// DM_MEM_MADVISE=0|1 (default 1 on iOS, 0 on macOS): hint page-aligned interiors of idle pooled command buffers (>= 64 KiB) with MADV_FREE_REUSABLE so iOS Jetsam deducts them from physical footprint without munmap churn.
+static int nq_madvise_on(void) {
+    static _Atomic int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        const char *e = getenv("DM_MEM_MADVISE");
+#if TARGET_OS_IPHONE
+        c = !(e && !strcmp(e, "0"));
+#else
+        c = (e && !strcmp(e, "1")) ? 1 : 0;
+#endif
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c;
+}
+static int nq_buf_advise(uint8_t *bytes, size_t cap, int reusable) {
+#if defined(__APPLE__) && defined(MADV_FREE_REUSABLE) && defined(MADV_FREE_REUSE)
+    if (!bytes || cap < (64u << 10)) return 0;
+    static uintptr_t ps;
+    if (!ps) { long p = sysconf(_SC_PAGESIZE); ps = p > 0 ? (uintptr_t)p : 16384u; }
+    uintptr_t lo = ((uintptr_t)bytes + ps - 1u) & ~(ps - 1u);
+    uintptr_t hi = ((uintptr_t)bytes + cap) & ~(ps - 1u);
+    if (hi <= lo) return 0;
+    return madvise((void *)lo, hi - lo, reusable ? MADV_FREE_REUSABLE : MADV_FREE_REUSE) == 0;
+#else
+    (void)bytes; (void)cap; (void)reusable; return 0;
+#endif
+}
+void nvn_queue_pool_trim(int drop_all) {
+    uint8_t *drop_bufs[NQ_BUF_POOL_MAX]; int nbuf = 0;
+    nq_job *drop_jobs = NULL;
+    pthread_mutex_lock(&nq_pool_mu);
+    int keep = drop_all ? 0 : 2;
+    while (nq_buf_pool_n > keep) {
+        nq_buf_pool_n--;
+        drop_bufs[nbuf++] = nq_buf_pool[nq_buf_pool_n].bytes;
+    }
+    if (drop_all) {
+        drop_jobs = nq_job_pool; nq_job_pool = NULL; nq_job_pool_n = 0;
+    } else {
+        while (nq_job_pool_n > 4 && nq_job_pool) {
+            nq_job *j = nq_job_pool; nq_job_pool = j->next; nq_job_pool_n--;
+            j->next = drop_jobs; drop_jobs = j;
+        }
+    }
+    pthread_mutex_unlock(&nq_pool_mu);
+    for (int i = 0; i < nbuf; i++) free(drop_bufs[i]);
+    for (nq_job *j = drop_jobs, *nx; j; j = nx) { nx = j->next; free(j->objects.keys); free(j->objects.vals); free(j); }
+}
 static void nq_buf_take(uint8_t **bytes, size_t *cap) {
+    int advised = 0;
     pthread_mutex_lock(&nq_pool_mu);
     if (nq_buf_pool_n > 0) {
         int best = 0;
         for (int i = 1; i < nq_buf_pool_n; i++) if (nq_buf_pool[i].cap > nq_buf_pool[best].cap) best = i;
-        *bytes = nq_buf_pool[best].bytes; *cap = nq_buf_pool[best].cap;
+        *bytes = nq_buf_pool[best].bytes; *cap = nq_buf_pool[best].cap; advised = nq_buf_pool[best].advised;
         nq_buf_pool[best] = nq_buf_pool[--nq_buf_pool_n];
         pthread_mutex_unlock(&nq_pool_mu);
+        if (advised) nq_buf_advise(*bytes, *cap, 0);
         return;
     }
     pthread_mutex_unlock(&nq_pool_mu);
@@ -43,15 +94,18 @@ static void nq_buf_take(uint8_t **bytes, size_t *cap) {
 static void nq_buf_put(uint8_t *bytes, size_t cap) {
     if (!bytes) return;
     if (cap >= 4096 && cap <= NQ_BUF_POOL_CAP_MAX) {
+        int advised = nq_madvise_on() ? nq_buf_advise(bytes, cap, 1) : 0;
         pthread_mutex_lock(&nq_pool_mu);
         if (nq_buf_pool_n < NQ_BUF_POOL_MAX) {
             nq_buf_pool[nq_buf_pool_n].bytes = bytes;
             nq_buf_pool[nq_buf_pool_n].cap = cap;
+            nq_buf_pool[nq_buf_pool_n].advised = advised;
             nq_buf_pool_n++;
             pthread_mutex_unlock(&nq_pool_mu);
             return;
         }
         pthread_mutex_unlock(&nq_pool_mu);
+        if (advised) nq_buf_advise(bytes, cap, 0);
     }
     free(bytes);
 }
@@ -292,10 +346,9 @@ static void nq_publish_staged(nq_job *j) {
     j->last=j->staged_last;
     j->staged_first=j->staged_last=NULL;
 }
-// Grow geometrically so flattening a large submission does not reallocate its command records at every page.
-static void nq_bytes(nq_node *n, const void *bytes, size_t length) {
-    if (length > SIZE_MAX - n->length) die("queue commands allocation overflow");
-    size_t want = n->length + length;
+static void nq_reserve(nq_node *n, size_t extra) {
+    if (extra > SIZE_MAX - n->length) die("queue commands allocation overflow");
+    size_t want = n->length + extra;
     if (want > n->capacity) {
         size_t cap = n->capacity <= SIZE_MAX / 2 ? 2 * n->capacity : want;
         cap = cap < want ? want : cap;
@@ -305,8 +358,30 @@ static void nq_bytes(nq_node *n, const void *bytes, size_t length) {
         n->bytes = grown;
         n->capacity = cap;
     }
+}
+// Grow geometrically so flattening a large submission does not reallocate its command records at every page.
+static inline void nq_bytes(nq_node *n, const void *bytes, size_t length) {
+    if (!length) return;
+    if (__builtin_expect(length > n->capacity - n->length, 0)) nq_reserve(n, length);
     memcpy(n->bytes + n->length, bytes, length);
-    n->length = want;
+    n->length += length;
+}
+// Known commands that carry zero CAP_K_PROG / CAP_K_TEX object pointers (nq_snapshot_address is a no-op): skip cap_rec_fields() indirect dispatch on the hot flatten path.
+static inline int nq_op_no_obj(uint32_t op) {
+    switch (op) {
+        case OP_BEGIN: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE:
+        case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1:
+        case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_TEX1:
+        case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BARRIER: case OP_COPY_STRIDE:
+        case OP_BLEND_COLOR: case OP_RESET_COUNTER: case OP_REPORT_COUNTER: case OP_DEPTH_CLAMP: case OP_PATCH_SIZE:
+        case OP_LINE_WIDTH: case OP_RAST_DISCARD: case OP_VP_SWIZZLE: case OP_PRIM_RESTART: case OP_ALPHA_REF:
+        case OP_PUSH_CONST: case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: case OP_DRAW_TEX: case OP_DISPATCH:
+        case OP_COPY_B2B: case OP_UPDATE_UB: case OP_CLEAR_BUF: case OP_TF_BIND: case OP_TF_STATE: case OP_RENDER_COND:
+        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_SIGNAL_EVENT:
+            return 1;
+        default:
+            return 0;
+    }
 }
 static void nq_signal_add(nq_node *n,nq_signal s) {
     if(!(n->signal_count&(n->signal_count-1))) { n->signals=realloc(n->signals,(n->signal_count?2*n->signal_count:1)*sizeof *n->signals); if(!n->signals) die("queue signals allocation failed"); } // NOLINT(bugprone-suspicious-realloc-usage): allocation failure aborts
@@ -333,11 +408,13 @@ static void nq_record_one(nq_job *j,const uint8_t *p,op_hdr h) {
     } else {
         nq_node *n=j->staged_last; if(!n || n->kind!=NQ_COMMANDS || n->closed) n=nq_append(j,NQ_COMMANDS);
         size_t offset=n->length; nq_bytes(n,p,h.size); if(!n->bytes) die("queue commands: a record of %u bytes",h.size);
-        if(h.op==OP_AS_BUILD) {
-            if(h.size<8+sizeof(p_as_build))die("invalid acceleration-structure command size");
-            nq_as_snapshot(j,(p_as_build *)(n->bytes+offset+8));
+        if(!nq_op_no_obj(h.op)) {
+            if(h.op==OP_AS_BUILD) {
+                if(h.size<8+sizeof(p_as_build))die("invalid acceleration-structure command size");
+                nq_as_snapshot(j,(p_as_build *)(n->bytes+offset+8));
+            }
+            if(!cap_rec_fields(h.op,n->bytes+offset+8,h.size,&nq_snapshot_ops,j)) die("queue snapshot: unknown command %u",h.op);
         }
-        if(!cap_rec_fields(h.op,n->bytes+offset+8,h.size,&nq_snapshot_ops,j)) die("queue snapshot: unknown command %u",h.op);
         if(h.op==OP_SIGNAL_EVENT) {
             nq_signal sig; memcpy(&sig.event,a,8); memcpy(&sig.mode,a+8,4); memcpy(&sig.value,a+12,4); nq_signal_add(n,sig);
         }
@@ -357,7 +434,8 @@ static void nq_flatten(nq_job *j,const uint8_t *list) {
         uint64_t v; memcpy(&v,e,8); unsigned k=ctl_kind(v);
         if(k==CTL_LINK) { e=ctl_addr(v)-8; continue; }
         if(k!=CTL_CHUNK) die("NVN command list %p: corrupt control entry %#llx at %p",(const void *)list,(unsigned long long)v,(const void *)e);
-        const uint8_t *p=ctl_addr(v),*pe=p+ctl_chunk_bytes(v); op_hdr h;
+        const uint8_t *p=ctl_addr(v); size_t cbytes=ctl_chunk_bytes(v); const uint8_t *pe=p+cbytes; op_hdr h;
+        if(cbytes && j->staged_last && j->staged_last->kind==NQ_COMMANDS && !j->staged_last->closed) nq_reserve(j->staged_last, cbytes+8);
         while(nvn_piece_record(list,v,p,pe,&h)) { nq_record(j,p,h); p+=h.size; }
         if(v&CTL_LAST) return;
     }
