@@ -169,7 +169,7 @@ static int rx_idle_fb_on(void) {
     return fbm && sw_on(fbm);
 }
 static int rx_ev_on(void) {
-    static int evm = -1; if (evm < 0) evm = sw_mode("DM_NVN_RX_EVENT", 1);
+    static int evm = -1; if (evm < 0) evm = sw_mode("DM_NVN_RX_EVENT", 0);
     return sw_on(evm);
 }
 static void rx_mark(void) { if (!g_rx_ev) g_rx_ev = [g_dev newSharedEvent]; [g_q4 signalEvent:g_rx_ev value:++g_rx_seq]; }   // after a commit, under g_res_commit_mu

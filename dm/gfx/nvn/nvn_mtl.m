@@ -573,7 +573,7 @@ static void rh_trim(void) {
     if (!g_rh_n) return;
     int tier = mem_gov_on() ? atomic_load_explicit(&g_mem_tier, memory_order_relaxed) : 0;
     uint64_t idle_ns = tier == 0 ? RH_IDLE_NS : (tier == 1 ? 1000000000ull : (tier == 2 ? 500000000ull : 0ull));
-    uint64_t cap = tier == 0 ? RH_CAP : (tier == 1 ? (64u << 20) : (tier == 2 ? (16u << 20) : 0u));
+    uint64_t cap = tier == 0 ? RH_CAP : (tier == 1 ? (64u << 20) : (tier == 2 ? (32u << 20) : 0u));
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC); void *drop[64]; unsigned nd = 0;
     os_unfair_lock_lock(&g_rh_lk);
     while (g_rh_n && nd < 64) {
@@ -1729,7 +1729,7 @@ static void mem_governor_tick(void) {
     int av_tier = avail_mb < 250 ? 3 : (avail_mb < 450 ? 2 : (avail_mb < 800 ? 1 : 0));
     if (av_tier > tier) tier = av_tier;
 #endif
-    if (thermal_proactive_mtl() && atomic_load_explicit(&g_mtl_thermal_state, memory_order_relaxed) >= 2 && tier < 2) tier = 2;
+    // Never escalate memory eviction from thermal state alone: shrinking recycled texture heaps while GBs of headroom exist causes severe allocation/residency churn and adds GPU zero-fill heat.
     atomic_store_explicit(&g_mem_tier, tier, memory_order_relaxed);
     if (tier != prev) {
         MLOG("memory governor: tier %d -> %d (headroom %llu MB, os_pressure %d, gpu %llu MB)",

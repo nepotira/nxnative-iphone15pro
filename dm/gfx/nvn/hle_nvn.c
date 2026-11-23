@@ -2342,13 +2342,8 @@ static void rt_declare(rt_thr *t, uint64_t period_ns, double comp_ms) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     double cap = period_ns * 0.9 / 1e6;
     if (thermal_proactive_on() && !t->acq) {
-        int th = dm_thermal_now();
-        mtl_thermal_set(th);
-        if (th >= 1) {
-            comp_ms *= 0.85;
-            double th_cap = period_ns * 0.45 / 1e6;
-            if (cap > th_cap) cap = th_cap;
-        }
+        // Keep MetalFX thermal shedding informed, but never shrink RT computation budgets: under-declaring comp_ms causes XNU to demote submit/encode threads to E-cores (~0.95 GHz).
+        mtl_thermal_set(dm_thermal_now());
     }
     if (comp_ms > cap) comp_ms = cap; if (comp_ms < 1) comp_ms = 1;
     uint64_t comp_ns = (uint64_t)(comp_ms * 1e6);
