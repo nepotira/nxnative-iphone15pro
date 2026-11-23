@@ -131,6 +131,7 @@ DM_MEMSTAT	diagnostic	`=<tsv>` writes one line per second of memory accounting: 
 DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second writes every VM region of 1 MiB or more to `<tsv>.regions`
 DM_MEMSTAT_WALK	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, walks VM regions for the class breakdown every N seconds (default 1; walking every second costs about 9 M cycles a frame on another core in OoT), while the totals stay per second and intermediate lines repeat the last walk's class columns
 DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
+DM_MEM_MADVISE	switch	`1` (default on iOS, `0` on the Mac) hints page-aligned interiors of idle pooled command buffers (>= 64 KiB) with `MADV_FREE_REUSABLE` and restores `MADV_FREE_REUSE` on reuse or trim; `0` disables it
 DM_MESH_PAIRS	path	The prebuild's mesh shader triple table (default: `mesh_pairs.tsv` beside the shader map)
 DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
 DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
@@ -237,6 +238,7 @@ DM_NVN_PREFETCH	switch	`0` turns off loading a program's shader libraries in the
 DM_NVN_PRESENT_FINISH	diagnostic	`=1` makes each present return once the GPU has run the frame, so the game never runs ahead of the GPU
 DM_NVN_PROF	diagnostic	`=1` wraps the implemented NVN functions in a timing wrapper and collects the time each takes during recording
 DM_NVN_PROGTRACE	diagnostic	`=<vertex keys,...>` logs matching ProgramSetShaders calls and their guest backtraces
+DM_NVN_QOS_PROMOTE	switch	`1` (default) promotes guest threads that call `nvnQueueSubmitCommands` or `nvnWindowAcquireTexture` to `QOS_CLASS_USER_INTERACTIVE` under `DM_QOS_MAP=1`; `0` disables promotion
 DM_NVN_REGLUM	diagnostic	`=x0,y0,x1,y1:<file>` (normalized coordinates): on every present records the present number, time, mean luminance and a grayscale thumbnail of that region, to check animation speed against frame rate
 DM_NVN_REPORT_EXACT	switch	`0` refuses a partly covered uniform shadow over the whole 4 KB page of a counter report of a running submission, as before; by default only over the report's own 16 bytes, which the host writes when that submission completes
 DM_NVN_REUPLOADS	diagnostic	`=1` logs the first 400 re-uploads of textures taken from their storage: shape, size, how much was read from guest memory and how many images were copied from the texture it replaces, the frame and the submission, the pages written since the upload and where the first lies, and the GPU copies into it since then
@@ -319,6 +321,7 @@ DM_OPMODE	player	The operation mode the game sees: `0` handheld, `1` console (de
 DM_PAD_IDENTICAL	switch	`0` stops reading identical pads here when GameController lists fewer of their model than IOKit has, such as two Pro Controllers over USB (each a player of its own: a Pro Controller from its report 0x30, another model from its HID elements; `pad_hid_mac.h`, `pad_pro.h`); `DM_HID_PADS=0` stops it too; Mac only
 DM_PAD_MERGE	switch	`=1` merges every controller into player 1, as before, instead of giving each controller a player of its own (Mac and iOS)
 DM_PAD_PRESS_TO_JOIN	player	`1`: a controller is no player until one of its buttons is pressed, then it is the lowest player free, whatever its port, link or model, identical pads included (`front_mac.m`, `DmGamepad.m`, `pad_slots.h`); not with `DM_PAD_MERGE`. Launcher setting
+DM_PAD_SWAP_FACE	player	`1` swaps A/B and X/Y face buttons on Apple game controllers for Nintendo layout; `0` (default) keeps raw controller layout
 DM_PATCH_FRONT	switch	`=<bytes>`: the size of the patch area right before the module base for a long text (`BIG_TEXT`); set only by the rewriter's own rerun with the size it needs
 DM_PHONE_MOTION	switch	On iOS, whether the phone's own device motion drives player 1's six-axis sensor: `auto` (default) while no controller supplies fresh motion, `1` phone only, `0` never; each source keeps its own orientation
 DM_PICTURE_FIT	player	`fill` scales the 16:9 picture until it covers the screen (iPhone/iPad landscape) or Mac window and crops the edges (portrait, tabletop split and TV stay fitted on iOS); `fit` or unset, the largest 16:9 rectangle with black bars. Launcher and iOS in-game menu setting
@@ -397,8 +400,10 @@ DM_RESOURCE_TITLE	switch	Game profile title ID, written to `Gen/resources.env` b
 DM_RESOURCE_VERSION	switch	Display version, written to `Gen/resources.env` by `gen_resources.py`; with `DM_COPY_ROMFS=NO` the copy phase puts it in the `version=` field of the app's `romfs.id`
 DM_RES_CHECK	diagnostic	`=1` prints the first 40 textures or buffers a shader reaches through its argument block that are not in the residency set (textures attributed to their parent allocation)
 DM_REWRITE_J	switch	`=<positive integer>`: worker processes per module for `patch_nso.py`'s x18 scan and spin wait search; `=1` runs serially. Default: one per core directly, an automatic per-module budget in the NSP script. An explicit value overrides that budget
+DM_REWRITE_LSE	switch	`1` (default) lowers eligible 3- and 4-instruction ARMv8.0 LL/SC atomic loops (`ldaxr`/`stlxr`/`cbnz`) to single-instruction ARMv8.1 LSE atomics (`swpal`, `ldaddal`, `ldsetal`, `ldeoral`, `ldclral`); `0` keeps original LL/SC loops
 DM_ROMFS	path	The game's RomFS folder, mounted read-only as `rom` (default `$DM_ROOT/romfs`); the Mac launcher, the iOS app and the NSP script set it
 DM_ROMFS_OVERLAY	path	`=<dir>[:<dir>…]`: RomFS reads look in these folders first, in order, and fall back to `DM_ROMFS` (for a modified copy of some files); on the Mac, a folder's mod also loads prepared code plugins from `<mod>/exefs/nxnative/` (`scripts/prepare_mod.py`)
+DM_ROMFS_OVERLAY_DIR	path	Directory packed into `DmIOS.app/romfs_overlay` by `build_ipa.sh` (used by `main.m` as `DM_ROMFS_OVERLAY` at boot)
 DM_ROMFS_PROGRAMS	path	The folder of the other programs' RomFS images of the application, `<index>.img`, which `fs::MountRom(name, index, …)` mounts (default `romfs_programs` beside `DM_ROMFS`; the NSP script packs them from a NUP of several programs); the iOS app sets it to the app's folder when its RomFS is in Documents
 DM_ROOT	path	Workspace root (default `~/dm-work`): the host's and tools' default paths (RomFS, temporary storage, shader libraries under `build/cache/metal_shader_cache`, probe dumps) are under it
 DM_ROTATION	player	iPhone and iPad orientation lock (`auto` follows the device and its Info.plist list, `landscape` locks landscape, `portrait` locks upright even on landscape-only iPhones); launcher and in-game menu setting
@@ -466,6 +471,7 @@ DM_TEST_TESS	test	Path to the native t_tess executable that test_dmsh_tess.py ru
 DM_TEST_TRANSFORM_FEEDBACK	test	Path to the native t_transform_feedback executable used by the Python feedback tests
 DM_TEST_UP_LOST	diagnostic	`=<batch index>` treats that batch of uploads as dropped, to exercise the re-upload path
 DM_THERMAL_CAP	switch	`0` turns off the thermal cap, which holds the frame step at 30 fps (also from 40) while iOS reports a serious or critical thermal state (on by default)
+DM_THERMAL_PROACTIVE	switch	`1` (default on iOS, `0` on the Mac) sheds `DM_PRESENT_UPSCALE=metalfx` to hardware bilinear once iOS reaches `thermalState >= 1` (Fair) without shrinking RT thread computation budgets or evicting texture heaps; `0` disables proactive shedding
 DM_THR	diagnostic	`=1` logs each SVC (except `SleepThread`) with its first four arguments, and each `CreateThread` with entry, stack, priority and core
 DM_THRCPU	diagnostic	`=<tsv path>[,<seconds>]` writes each thread's CPU time (100% = one core) and the total every interval (default 10 s); on iOS a relative path is under `Documents`, and `Documents/env.txt` can set it
 DM_TOUCH_HAPTICS	player	`0` turns off the light haptic tap when a touch control is pressed (on by default); launcher setting
