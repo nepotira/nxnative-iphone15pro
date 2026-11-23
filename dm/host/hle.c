@@ -95,6 +95,8 @@ typedef struct { uint64_t ret; int kind, arg; uint64_t orig; } gate_t;
 // All gates, including NROs, are registered by load_modules before guest execution. Grow and rehash there;
 // dispatch only reads the finished table, so no allocation, lock or relocation is needed on the hot path.
 static gate_t *g_gate;
+// Direct-mapped 32768-slot fast table read by entry.S _dm_gate for mrs xN, cntpct_el0 / cntvct_el0 (skips 32 NEON spills and fpcr/fpsr pipeline flush).
+struct { uint64_t ret, reg; } dm_fast_cntpct[1u << 15];
 static size_t g_ngate, g_gate_cap;
 static unsigned g_gate_bits = 15;   // initially 32768 slots; keep the load factor at most 1/4
 static inline size_t gate_h(uint64_t a, unsigned bits) { return (size_t)(((a >> 2) * 0x9E3779B97F4A7C15ull) >> (64 - bits)); }
@@ -120,6 +122,13 @@ void gate_register(uint64_t ret_abs, const char *kind, int arg, uint64_t orig) {
     size_t i = gate_h(ret_abs, g_gate_bits) & (g_gate_cap - 1);
     while (g_gate[i].ret) { if (g_gate[i].ret == ret_abs) die("gate registered twice %#llx", ret_abs); i = (i + 1) & (g_gate_cap - 1); }
     g_gate[i] = (gate_t){ret_abs, k, arg, orig}; g_ngate++;
+    if ((k == G_CNTPCT || k == G_CNTVCT) && arg >= 0 && arg <= 28 && arg != 18) {
+        size_t h = gate_h(ret_abs, 15) & ((1u << 15) - 1);
+        if (!dm_fast_cntpct[h].ret) {
+            dm_fast_cntpct[h].ret = ret_abs;
+            dm_fast_cntpct[h].reg = (uint64_t)arg;
+        }
+    }
 }
 
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr);   // hle_svc.c
