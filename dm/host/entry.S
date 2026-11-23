@@ -57,15 +57,115 @@ _dm_gate:
     // Layout as before: x0..x30 at +0 (x30 = the return point), q0..q31 at +256, nzcv / fpsr / fpcr at +768 / +776 / +784, and at +792 the gate block's sp
     // (the guest's x29 / x30 the block pushed; the guest's stack follows at +16)
     sub x30, x30, #800
+    // Fast-path check for mrs xN, cntpct_el0 / cntvct_el0: avoid saving 32 NEON registers (512 B) and serializing fpcr/fpsr.
+    // Save x8..x11 into their final frame slots first; none of the check instructions modify nzcv.
+    stp x8, x9, [x30, #64]
+    stp x10, x11, [x30, #80]
+    adrp x9, _dm_clock_bg_frozen@PAGE
+    ldr w9, [x9, _dm_clock_bg_frozen@PAGEOFF]
+    cbnz w9, Ldm_gate_full
+    lsr x9, x29, #2
+    movz x10, #0x7C15
+    movk x10, #0x7F4A, lsl #16
+    movk x10, #0x79B9, lsl #32
+    movk x10, #0x9E37, lsl #48
+    mul x9, x9, x10
+    lsr x9, x9, #49
+    adrp x10, _dm_fast_cntpct@PAGE
+    add x10, x10, _dm_fast_cntpct@PAGEOFF
+    add x10, x10, x9, lsl #4
+    ldp x9, x11, [x10]
+    eor x9, x9, x29
+    cbnz x9, Ldm_gate_full
+    // Fast cntpct/cntvct hit (x11 = target reg 0..28, != 18; dm_clock_bg_frozen == 0):
+    // Save only caller-saved GPRs x0..x7, x12..x17, nzcv, return point, target reg, and guest sp.
     stp x0, x1, [x30, #0]
     stp x2, x3, [x30, #16]
     stp x4, x5, [x30, #32]
     stp x6, x7, [x30, #48]
-    stp x8, x9, [x30, #64]
-    stp x10, x11, [x30, #80]
     stp x12, x13, [x30, #96]
     stp x14, x15, [x30, #112]
     stp x16, x17, [x30, #128]
+    mrs x9, nzcv
+    str x9, [x30, #768]
+    stp x29, x11, [x30, #240]     // +240 = return point, +248 = target reg index
+    mov x9, sp
+    str x9, [x30, #792]
+    mov sp, x30
+    bl _dm_cntpct_fast
+    cbz x1, Ldm_cntpct_fallback
+    ldr x11, [sp, #248]
+    cmp x11, #18
+    b.hs Ldm_cntpct_hi
+    str x0, [sp, x11, lsl #3]
+    b Ldm_cntpct_done
+Ldm_cntpct_hi:
+    sub x11, x11, #19
+    adr x10, Ldm_cntpct_jt
+    add x10, x10, x11, lsl #3
+    br x10
+Ldm_cntpct_jt:
+    mov x19, x0
+    b Ldm_cntpct_done
+    mov x20, x0
+    b Ldm_cntpct_done
+    mov x21, x0
+    b Ldm_cntpct_done
+    mov x22, x0
+    b Ldm_cntpct_done
+    mov x23, x0
+    b Ldm_cntpct_done
+    mov x24, x0
+    b Ldm_cntpct_done
+    mov x25, x0
+    b Ldm_cntpct_done
+    mov x26, x0
+    b Ldm_cntpct_done
+    mov x27, x0
+    b Ldm_cntpct_done
+    mov x28, x0
+    b Ldm_cntpct_done
+Ldm_cntpct_jt_end:
+    .if (Ldm_cntpct_jt_end - Ldm_cntpct_jt) != 80
+    .error "Ldm_cntpct_jt must be 10 entries x 8 bytes (mov + b)"
+    .endif
+Ldm_cntpct_done:
+    ldr x9, [sp, #768]
+    msr nzcv, x9
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldr x30, [sp, #240]
+    ldr x29, [sp, #792]
+    mov sp, x29
+    ret
+
+Ldm_cntpct_fallback:
+    // Rare race: app entered background right after _dm_clock_bg_frozen check.
+    // x0..x17 are already saved in [sp, #0..#143] and x18..x28/q0..q31/fpsr/fpcr are untouched.
+    mov x30, sp
+    ldr x29, [x30, #240]
+    ldr x9, [x30, #792]
+    mov sp, x9
+    ldr x9, [x30, #768]
+    msr nzcv, x9
+    b Ldm_gate_full_after_gprs
+
+Ldm_gate_full:
+    stp x0, x1, [x30, #0]
+    stp x2, x3, [x30, #16]
+    stp x4, x5, [x30, #32]
+    stp x6, x7, [x30, #48]
+    stp x12, x13, [x30, #96]
+    stp x14, x15, [x30, #112]
+    stp x16, x17, [x30, #128]
+Ldm_gate_full_after_gprs:
     stp x18, x19, [x30, #144]
     stp x20, x21, [x30, #160]
     stp x22, x23, [x30, #176]
