@@ -20,8 +20,129 @@ typedef struct nq_owned { struct nq_owned *next; unsigned kind; uint64_t data[];
 // An empty open job stays at the head of its queue until more nodes arrive.
 typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame, submitted;
     nq_node *staged_first, *staged_last; int open, waits; } nq_job;
+// Recycled arenas for nq_job (with its nvn_hmap backing) and nq_node command buffers to eliminate per-submission calloc/realloc/free churn.
+enum { NQ_BUF_POOL_MAX = 8, NQ_BUF_POOL_CAP_MAX = 2u << 20, NQ_JOB_POOL_MAX = 16 };
+static pthread_mutex_t nq_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint8_t *bytes; size_t cap; int advised; } nq_buf_pool[NQ_BUF_POOL_MAX];
+static int nq_buf_pool_n;
+static nq_job *nq_job_pool;
+static int nq_job_pool_n;
+// DM_MEM_MADVISE=0|1 (default 1 on iOS, 0 on macOS): hint page-aligned interiors of idle pooled command buffers (>= 64 KiB) with MADV_FREE_REUSABLE so iOS Jetsam deducts them from physical footprint without munmap churn.
+static int nq_madvise_on(void) {
+    static _Atomic int v = -1;
+    int c = atomic_load_explicit(&v, memory_order_relaxed);
+    if (c < 0) {
+        const char *e = getenv("DM_MEM_MADVISE");
+#if TARGET_OS_IPHONE
+        c = !(e && !strcmp(e, "0"));
+#else
+        c = (e && !strcmp(e, "1")) ? 1 : 0;
+#endif
+        atomic_store_explicit(&v, c, memory_order_relaxed);
+    }
+    return c;
+}
+static int nq_buf_advise(uint8_t *bytes, size_t cap, int reusable) {
+#if defined(__APPLE__) && defined(MADV_FREE_REUSABLE) && defined(MADV_FREE_REUSE)
+    if (!bytes || cap < (64u << 10)) return 0;
+    static uintptr_t ps;
+    if (!ps) { long p = sysconf(_SC_PAGESIZE); ps = p > 0 ? (uintptr_t)p : 16384u; }
+    uintptr_t lo = ((uintptr_t)bytes + ps - 1u) & ~(ps - 1u);
+    uintptr_t hi = ((uintptr_t)bytes + cap) & ~(ps - 1u);
+    if (hi <= lo) return 0;
+    return madvise((void *)lo, hi - lo, reusable ? MADV_FREE_REUSABLE : MADV_FREE_REUSE) == 0;
+#else
+    (void)bytes; (void)cap; (void)reusable; return 0;
+#endif
+}
+void nvn_queue_pool_trim(int drop_all) {
+    struct { uint8_t *bytes; size_t cap; int advised; } drop_bufs[NQ_BUF_POOL_MAX]; int nbuf = 0;
+    nq_job *drop_jobs = NULL;
+    pthread_mutex_lock(&nq_pool_mu);
+    int keep = drop_all ? 0 : 2;
+    while (nq_buf_pool_n > keep) {
+        nq_buf_pool_n--;
+        drop_bufs[nbuf].bytes = nq_buf_pool[nq_buf_pool_n].bytes;
+        drop_bufs[nbuf].cap = nq_buf_pool[nq_buf_pool_n].cap;
+        drop_bufs[nbuf].advised = nq_buf_pool[nq_buf_pool_n].advised;
+        nbuf++;
+    }
+    if (drop_all) {
+        drop_jobs = nq_job_pool; nq_job_pool = NULL; nq_job_pool_n = 0;
+    } else {
+        while (nq_job_pool_n > 4 && nq_job_pool) {
+            nq_job *j = nq_job_pool; nq_job_pool = j->next; nq_job_pool_n--;
+            j->next = drop_jobs; drop_jobs = j;
+        }
+    }
+    pthread_mutex_unlock(&nq_pool_mu);
+    for (int i = 0; i < nbuf; i++) {
+        if (drop_bufs[i].advised) nq_buf_advise(drop_bufs[i].bytes, drop_bufs[i].cap, 0);
+        free(drop_bufs[i].bytes);
+    }
+    for (nq_job *j = drop_jobs, *nx; j; j = nx) { nx = j->next; free(j->objects.keys); free(j->objects.vals); free(j); }
+}
+static void nq_buf_take(uint8_t **bytes, size_t *cap) {
+    int advised = 0;
+    pthread_mutex_lock(&nq_pool_mu);
+    if (nq_buf_pool_n > 0) {
+        int best = 0;
+        for (int i = 1; i < nq_buf_pool_n; i++) if (nq_buf_pool[i].cap > nq_buf_pool[best].cap) best = i;
+        *bytes = nq_buf_pool[best].bytes; *cap = nq_buf_pool[best].cap; advised = nq_buf_pool[best].advised;
+        nq_buf_pool[best] = nq_buf_pool[--nq_buf_pool_n];
+        pthread_mutex_unlock(&nq_pool_mu);
+        if (advised) nq_buf_advise(*bytes, *cap, 0);
+        return;
+    }
+    pthread_mutex_unlock(&nq_pool_mu);
+    *bytes = NULL; *cap = 0;
+}
+static void nq_buf_put(uint8_t *bytes, size_t cap) {
+    if (!bytes) return;
+    if (cap >= 4096 && cap <= NQ_BUF_POOL_CAP_MAX) {
+        int advised = nq_madvise_on() ? nq_buf_advise(bytes, cap, 1) : 0;
+        pthread_mutex_lock(&nq_pool_mu);
+        if (nq_buf_pool_n < NQ_BUF_POOL_MAX) {
+            nq_buf_pool[nq_buf_pool_n].bytes = bytes;
+            nq_buf_pool[nq_buf_pool_n].cap = cap;
+            nq_buf_pool[nq_buf_pool_n].advised = advised;
+            nq_buf_pool_n++;
+            pthread_mutex_unlock(&nq_pool_mu);
+            return;
+        }
+        pthread_mutex_unlock(&nq_pool_mu);
+        if (advised) nq_buf_advise(bytes, cap, 0);
+    }
+    free(bytes);
+}
+static nq_job *nq_job_alloc(void) {
+    pthread_mutex_lock(&nq_pool_mu);
+    nq_job *j = nq_job_pool;
+    if (j) { nq_job_pool = j->next; nq_job_pool_n--; }
+    pthread_mutex_unlock(&nq_pool_mu);
+    if (j) {
+        nvn_hmap saved = j->objects;
+        memset(j, 0, sizeof *j);
+        j->objects = saved;
+        return j;
+    }
+    j = calloc(1, sizeof *j);
+    if (!j) die("queue job allocation failed");
+    return j;
+}
 static void nq_job_free(nq_job *j) {
     for(nq_owned *o=j->owned,*next;o;o=next) { next=o->next; if(o->kind==CAP_K_PROG) mtl_prog_unpin((prog_t *)o->data); else if(o->kind==CAP_K_TEX) mtl_tex_unpin(((tex_t *)o->data)->serial); free(o); }
+    j->owned = NULL;
+    if (j->objects.cap <= 2048) {
+        nvn_hm_clear(&j->objects, NULL);
+        pthread_mutex_lock(&nq_pool_mu);
+        if (nq_job_pool_n < NQ_JOB_POOL_MAX) {
+            j->next = nq_job_pool; nq_job_pool = j; nq_job_pool_n++;
+            pthread_mutex_unlock(&nq_pool_mu);
+            return;
+        }
+        pthread_mutex_unlock(&nq_pool_mu);
+    }
     free(j->objects.keys); free(j->objects.vals); free(j);
 }
 static int nq_snapshot_address(void *ctx,uint64_t *field,uint64_t len,int writable) { (void)ctx;(void)field;(void)len;(void)writable;return 1; }
@@ -226,7 +347,8 @@ static void *nq_worker(void *unused) {
             }
             nq_cost_end(cost); gfx_leave(); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
         }
-        pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; q->copy=copy; j->receipt->present=present; j->receipt->copy=copy; } if(fence) { q->physical=fence; for(unsigned i=0;i<n->signal_count;i++) nq_event_issued(n->signals[i].event,fence,n->signals[i].mode,n->signals[i].value); } if(n->receipt) nq_put(n->receipt); free(n->signals); free(n->bytes); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+        pthread_mutex_lock(&nq_mu); if(n->kind==NQ_PRESENT) { q->present=present; q->copy=copy; j->receipt->present=present; j->receipt->copy=copy; } if(fence) { q->physical=fence; for(unsigned i=0;i<n->signal_count;i++) nq_event_issued(n->signals[i].event,fence,n->signals[i].mode,n->signals[i].value); } if(n->receipt) nq_put(n->receipt); uint8_t *old_bytes=n->bytes; size_t old_cap=n->capacity; free(n->signals); free(n); pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
+        nq_buf_put(old_bytes, old_cap);
     }
     return NULL;
 }
@@ -235,6 +357,7 @@ static void nq_start(void) { pthread_t t; if(pthread_create(&t,NULL,nq_worker,NU
 static nq_node *nq_append(nq_job *j,unsigned kind) {
     nq_node *n=calloc(1,sizeof *n); if(!n) die("queue continuation allocation failed");
     n->kind=kind;
+    if(kind==NQ_COMMANDS) nq_buf_take(&n->bytes,&n->capacity);
     if(j->staged_last) j->staged_last->next=n; else j->staged_first=n;
     j->staged_last=n;
     j->waits|=kind==NQ_EVENT || kind==NQ_SYNC;
@@ -254,10 +377,9 @@ static void nq_publish_staged(nq_job *j) {
     j->last=j->staged_last;
     j->staged_first=j->staged_last=NULL;
 }
-// Grow geometrically so flattening a large submission does not reallocate its command records at every page.
-static void nq_bytes(nq_node *n, const void *bytes, size_t length) {
-    if (length > SIZE_MAX - n->length) die("queue commands allocation overflow");
-    size_t want = n->length + length;
+static void nq_reserve(nq_node *n, size_t extra) {
+    if (extra > SIZE_MAX - n->length) die("queue commands allocation overflow");
+    size_t want = n->length + extra;
     if (want > n->capacity) {
         size_t cap = n->capacity <= SIZE_MAX / 2 ? 2 * n->capacity : want;
         cap = cap < want ? want : cap;
@@ -267,8 +389,30 @@ static void nq_bytes(nq_node *n, const void *bytes, size_t length) {
         n->bytes = grown;
         n->capacity = cap;
     }
+}
+// Grow geometrically so flattening a large submission does not reallocate its command records at every page.
+static inline void nq_bytes(nq_node *n, const void *bytes, size_t length) {
+    if (!length) return;
+    if (__builtin_expect(length > n->capacity - n->length, 0)) nq_reserve(n, length);
     memcpy(n->bytes + n->length, bytes, length);
-    n->length = want;
+    n->length += length;
+}
+// Known commands that carry zero CAP_K_PROG / CAP_K_TEX object pointers (nq_snapshot_address is a no-op): skip cap_rec_fields() indirect dispatch on the hot flatten path.
+static inline int nq_op_no_obj(uint32_t op) {
+    switch (op) {
+        case OP_BEGIN: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE:
+        case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1:
+        case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_TEX1:
+        case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BARRIER: case OP_COPY_STRIDE:
+        case OP_BLEND_COLOR: case OP_RESET_COUNTER: case OP_REPORT_COUNTER: case OP_DEPTH_CLAMP: case OP_PATCH_SIZE:
+        case OP_LINE_WIDTH: case OP_RAST_DISCARD: case OP_VP_SWIZZLE: case OP_PRIM_RESTART: case OP_ALPHA_REF:
+        case OP_PUSH_CONST: case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: case OP_DRAW_TEX: case OP_DISPATCH:
+        case OP_COPY_B2B: case OP_UPDATE_UB: case OP_CLEAR_BUF: case OP_TF_BIND: case OP_TF_STATE: case OP_RENDER_COND:
+        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_SIGNAL_EVENT:
+            return 1;
+        default:
+            return 0;
+    }
 }
 static void nq_signal_add(nq_node *n,nq_signal s) {
     if(!(n->signal_count&(n->signal_count-1))) { n->signals=realloc(n->signals,(n->signal_count?2*n->signal_count:1)*sizeof *n->signals); if(!n->signals) die("queue signals allocation failed"); } // NOLINT(bugprone-suspicious-realloc-usage): allocation failure aborts
@@ -295,11 +439,13 @@ static void nq_record_one(nq_job *j,const uint8_t *p,op_hdr h) {
     } else {
         nq_node *n=j->staged_last; if(!n || n->kind!=NQ_COMMANDS || n->closed) n=nq_append(j,NQ_COMMANDS);
         size_t offset=n->length; nq_bytes(n,p,h.size); if(!n->bytes) die("queue commands: a record of %u bytes",h.size);
-        if(h.op==OP_AS_BUILD) {
-            if(h.size<8+sizeof(p_as_build))die("invalid acceleration-structure command size");
-            nq_as_snapshot(j,(p_as_build *)(n->bytes+offset+8));
+        if(!nq_op_no_obj(h.op)) {
+            if(h.op==OP_AS_BUILD) {
+                if(h.size<8+sizeof(p_as_build))die("invalid acceleration-structure command size");
+                nq_as_snapshot(j,(p_as_build *)(n->bytes+offset+8));
+            }
+            if(!cap_rec_fields(h.op,n->bytes+offset+8,h.size,&nq_snapshot_ops,j)) die("queue snapshot: unknown command %u",h.op);
         }
-        if(!cap_rec_fields(h.op,n->bytes+offset+8,h.size,&nq_snapshot_ops,j)) die("queue snapshot: unknown command %u",h.op);
         if(h.op==OP_SIGNAL_EVENT) {
             nq_signal sig; memcpy(&sig.event,a,8); memcpy(&sig.mode,a+8,4); memcpy(&sig.value,a+12,4); nq_signal_add(n,sig);
         }
@@ -319,7 +465,8 @@ static void nq_flatten(nq_job *j,const uint8_t *list) {
         uint64_t v; memcpy(&v,e,8); unsigned k=ctl_kind(v);
         if(k==CTL_LINK) { e=ctl_addr(v)-8; continue; }
         if(k!=CTL_CHUNK) die("NVN command list %p: corrupt control entry %#llx at %p",(const void *)list,(unsigned long long)v,(const void *)e);
-        const uint8_t *p=ctl_addr(v),*pe=p+ctl_chunk_bytes(v); op_hdr h;
+        const uint8_t *p=ctl_addr(v); size_t cbytes=ctl_chunk_bytes(v); const uint8_t *pe=p+cbytes; op_hdr h;
+        if(cbytes && j->staged_last && j->staged_last->kind==NQ_COMMANDS && !j->staged_last->closed) nq_reserve(j->staged_last, cbytes+8);
         while(nvn_piece_record(list,v,p,pe,&h)) { nq_record(j,p,h); p+=h.size; }
         if(v&CTL_LAST) return;
     }
@@ -328,7 +475,7 @@ static void nq_enqueue(nq_queue *q,nq_job *j) { if(q->last) q->last->next=j; els
 // Publish the job before copying so the worker can replay closed nodes while
 // the game thread still owns the recording and copies its remaining commands.
 void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
-    pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue job allocation failed"); j->receipt=nq_new();
+    pthread_once(&nq_once,nq_start); nq_job *j=nq_job_alloc(); j->receipt=nq_new();
     j->objects.klen=16; j->frame=dm_nvn_frame_count(); j->submitted=guest_ns();
     // No scheduler lock while copying descriptors or resolving shader libraries.
     dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
@@ -351,7 +498,7 @@ void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
 // Only replay turns it into a physical display ticket; present never waits on the guest thread.
 uint64_t nvn_queue_present(queue_t *q,const tex_t *t,double period,const int crop[4]) {
     nvn_cap_queue(q->serial,0);
-    pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue present allocation failed");
+    pthread_once(&nq_once,nq_start); nq_job *j=nq_job_alloc();
     j->receipt=nq_new(); j->frame=dm_nvn_frame_count(); { void mtl_present_recorded(uint64_t); mtl_present_recorded(j->frame); }   // the game's own present count, for the screen wait (nvn_mtl.m)
     nq_node *n=nq_append(j,NQ_PRESENT);
     n->texture=*t; mtl_tex_pin(t->serial); n->period=period; if(crop) memcpy(n->crop,crop,sizeof n->crop);
@@ -409,7 +556,7 @@ int nvn_sync_wait(const sync_t *s,uint64_t timeout) {
 }
 void nvn_queue_wait_sync(queue_t *q,const sync_t *s) {
     nvn_cap_queue(q->serial,1);
-    pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue wait allocation failed"); j->receipt=nq_new();
+    pthread_once(&nq_once,nq_start); nq_job *j=nq_job_alloc(); j->receipt=nq_new();
     pthread_mutex_lock(&nq_mu); nq_snapshot_sync(nq_append(j,NQ_SYNC),s); nq_publish_staged(j); nq_enqueue(nq_get(q),j); pthread_mutex_unlock(&nq_mu);
 }
 void nvn_queue_finish(queue_t *q) { sync_t s={0}; nvn_queue_fence(q,&s); nvn_sync_wait(&s,UINT64_MAX); nvn_sync_release(&s);
