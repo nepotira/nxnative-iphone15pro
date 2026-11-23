@@ -99,11 +99,6 @@ struct { uint64_t ret, reg; } dm_fast_cntpct[1u << GATE_BITS];
 static int g_ngate;
 static inline unsigned gate_h(uint64_t a) { return (unsigned)(((a >> 2) * 0x9E3779B97F4A7C15ull) >> (64 - GATE_BITS)); }
 
-uint64_t dm_cntpct_fast(void) {
-    guest_clock_read_wait();
-    return guest_ticks();
-}
-
 void gate_register(uint64_t ret_abs, const char *kind, int arg, uint64_t orig) {
     int k = !strcmp(kind, "svc") ? G_SVC : !strcmp(kind, "cntpct") ? G_CNTPCT : !strcmp(kind, "cntvct") ? G_CNTVCT : !strcmp(kind, "obs") ? G_OBS : !strcmp(kind, "spin") ? G_SPIN : -1;
     if (k < 0) die("unknown gate kind %s", kind);

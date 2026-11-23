@@ -107,6 +107,16 @@ void guest_clock_read_wait(void) {
     while (g_gfz_reasons & 2u) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
     pthread_mutex_unlock(&g_gfz_mu);
 }
+// Lock-free integer-only cntpct/cntvct fast-path called by entry.S _dm_gate (no NEON/FP state saved by caller).
+// Returns (ticks, 1) in (x0, x1) on the fast path, or (0, 0) if a background freeze raced in and entry.S must fall back to the full gate.
+typedef struct { uint64_t ticks, ok; } dm_cntpct_res_t;
+dm_cntpct_res_t dm_cntpct_fast(void) {
+    if (__builtin_expect(atomic_load_explicit(&g_gfz_bg, memory_order_acquire) &&
+                         !atomic_load_explicit(&dm_host_work, memory_order_relaxed), 0))
+        return (dm_cntpct_res_t){0, 0};
+    dm_clock_reads++;
+    return (dm_cntpct_res_t){guest_ticks(), 1};
+}
 void guest_clock_freeze_for(int reason, int on) {
     pthread_mutex_lock(&g_gfz_mu);
     if (on) g_gfz_reasons |= 1u << reason; else g_gfz_reasons &= ~(1u << reason);

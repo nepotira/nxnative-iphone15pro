@@ -93,6 +93,7 @@ _dm_gate:
     str x9, [x30, #792]
     mov sp, x30
     bl _dm_cntpct_fast
+    cbz x1, Ldm_cntpct_fallback
     ldr x11, [sp, #248]
     cmp x11, #18
     b.hs Ldm_cntpct_hi
@@ -104,16 +105,30 @@ Ldm_cntpct_hi:
     add x10, x10, x11, lsl #3
     br x10
 Ldm_cntpct_jt:
-    mov x19, x0; b Ldm_cntpct_done
-    mov x20, x0; b Ldm_cntpct_done
-    mov x21, x0; b Ldm_cntpct_done
-    mov x22, x0; b Ldm_cntpct_done
-    mov x23, x0; b Ldm_cntpct_done
-    mov x24, x0; b Ldm_cntpct_done
-    mov x25, x0; b Ldm_cntpct_done
-    mov x26, x0; b Ldm_cntpct_done
-    mov x27, x0; b Ldm_cntpct_done
-    mov x28, x0; b Ldm_cntpct_done
+    mov x19, x0
+    b Ldm_cntpct_done
+    mov x20, x0
+    b Ldm_cntpct_done
+    mov x21, x0
+    b Ldm_cntpct_done
+    mov x22, x0
+    b Ldm_cntpct_done
+    mov x23, x0
+    b Ldm_cntpct_done
+    mov x24, x0
+    b Ldm_cntpct_done
+    mov x25, x0
+    b Ldm_cntpct_done
+    mov x26, x0
+    b Ldm_cntpct_done
+    mov x27, x0
+    b Ldm_cntpct_done
+    mov x28, x0
+    b Ldm_cntpct_done
+Ldm_cntpct_jt_end:
+    .if (Ldm_cntpct_jt_end - Ldm_cntpct_jt) != 80
+    .error "Ldm_cntpct_jt must be 10 entries x 8 bytes (mov + b)"
+    .endif
 Ldm_cntpct_done:
     ldr x9, [sp, #768]
     msr nzcv, x9
@@ -131,6 +146,17 @@ Ldm_cntpct_done:
     mov sp, x29
     ret
 
+Ldm_cntpct_fallback:
+    // Rare race: app entered background right after _dm_clock_bg_frozen check.
+    // x0..x17 are already saved in [sp, #0..#143] and x18..x28/q0..q31/fpsr/fpcr are untouched.
+    mov x30, sp
+    ldr x29, [x30, #240]
+    ldr x9, [x30, #792]
+    mov sp, x9
+    ldr x9, [x30, #768]
+    msr nzcv, x9
+    b Ldm_gate_full_after_gprs
+
 Ldm_gate_full:
     stp x0, x1, [x30, #0]
     stp x2, x3, [x30, #16]
@@ -139,6 +165,7 @@ Ldm_gate_full:
     stp x12, x13, [x30, #96]
     stp x14, x15, [x30, #112]
     stp x16, x17, [x30, #128]
+Ldm_gate_full_after_gprs:
     stp x18, x19, [x30, #144]
     stp x20, x21, [x30, #160]
     stp x22, x23, [x30, #176]

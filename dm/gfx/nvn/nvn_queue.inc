@@ -56,13 +56,16 @@ static int nq_buf_advise(uint8_t *bytes, size_t cap, int reusable) {
 #endif
 }
 void nvn_queue_pool_trim(int drop_all) {
-    uint8_t *drop_bufs[NQ_BUF_POOL_MAX]; int nbuf = 0;
+    struct { uint8_t *bytes; size_t cap; int advised; } drop_bufs[NQ_BUF_POOL_MAX]; int nbuf = 0;
     nq_job *drop_jobs = NULL;
     pthread_mutex_lock(&nq_pool_mu);
     int keep = drop_all ? 0 : 2;
     while (nq_buf_pool_n > keep) {
         nq_buf_pool_n--;
-        drop_bufs[nbuf++] = nq_buf_pool[nq_buf_pool_n].bytes;
+        drop_bufs[nbuf].bytes = nq_buf_pool[nq_buf_pool_n].bytes;
+        drop_bufs[nbuf].cap = nq_buf_pool[nq_buf_pool_n].cap;
+        drop_bufs[nbuf].advised = nq_buf_pool[nq_buf_pool_n].advised;
+        nbuf++;
     }
     if (drop_all) {
         drop_jobs = nq_job_pool; nq_job_pool = NULL; nq_job_pool_n = 0;
@@ -73,7 +76,10 @@ void nvn_queue_pool_trim(int drop_all) {
         }
     }
     pthread_mutex_unlock(&nq_pool_mu);
-    for (int i = 0; i < nbuf; i++) free(drop_bufs[i]);
+    for (int i = 0; i < nbuf; i++) {
+        if (drop_bufs[i].advised) nq_buf_advise(drop_bufs[i].bytes, drop_bufs[i].cap, 0);
+        free(drop_bufs[i].bytes);
+    }
     for (nq_job *j = drop_jobs, *nx; j; j = nx) { nx = j->next; free(j->objects.keys); free(j->objects.vals); free(j); }
 }
 static void nq_buf_take(uint8_t **bytes, size_t *cap) {
