@@ -981,3 +981,132 @@ def blend_zero(msl):
     helper = BLEND_ZERO % ((1 << bits) - 1, (1 << rb) - 1, abi.ROUND_8, abi.ROUND_16, abi.BLEND_OFF_FC,
                            ''.join(f'    dm_o.{nm} = dm_rop(dm_bz(dm_o.{nm}, m >> {bits * c}u), r >> {rb * c}u);\n' for nm, c in cols))
     return msl[:e['start']] + helper + '\n' + msl[e['start']:e['head'] - 1] + (', ' if e['params'] else '') + BLEND_ZERO_PARAM + ')' + body + msl[e['end']:], k
+
+
+# Native Apple AGX half2 SIMD folding for Maxwell/Ampere FP16x2 instructions (HADD2 / HMUL2 / HFMA2) widened to scalar float by SPIR-V translation:
+#   float _a0 = float2(as_type<half2>(U)).x; float _a1 = float2(as_type<half2>(U)).y;
+#   float _b0 = float2(as_type<half2>(V)).x; float _b1 = float2(as_type<half2>(V)).y;
+#   float _r0 = _a0 * _b0;                   float _r1 = _a1 * _b1;
+#   uint _p = as_type<uint>(half2(float2(_r0, _r1)));
+# collapses into:
+#   uint _p = as_type<uint>(as_type<half2>(U) * as_type<half2>(V));
+# Cutting 7 scalar FP32/conversion instructions to 1 native half2 SIMD instruction halves FP register pressure and feeds A17 Pro's 2x FP16 ALU + Dynamic Caching SRAM.
+_FP16_PURE = re.compile(r'^(?:as_type<uint>\(\s*_\d+\s*\)|uint\(\s*_\d+\s*\)|_\d+)$')
+_FP16_UNPACK = re.compile(r'^(?P<ind>[ \t]*)float\s+(?P<var>_\d+)\s*=\s*float2\(as_type<half2>\((?P<src>[^;]+)\)\)\.(?P<lane>[xy]);$')
+_FP16_BIN = re.compile(r'^(?P<ind>[ \t]*)float\s+(?P<var>_\d+)\s*=\s*(?P<a>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?)\s*(?P<op>[+\-*])\s*(?P<b>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?);$')
+_FP16_FMA = re.compile(r'^(?P<ind>[ \t]*)float\s+(?P<var>_\d+)\s*=\s*fma\((?P<a>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?),\s*(?P<b>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?),\s*(?P<c>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?)\);$')
+_FP16_PACK = re.compile(r'^(?P<ind>[ \t]*)(?P<lhs>(?:uint\s+_\d+|_\d+)\s*=\s*)as_type<uint>\(half2\(float2\((?P<x>_\d+),\s*(?P<y>_\d+)\)\)\);$')
+_FP16_IDENT = re.compile(r'\b(_\d+)\b')
+_FP16_ASSIGN = re.compile(r'^\s*(?:[a-zA-Z0-9_<>]+\s+)?(_\d+)\s*(?:[+\-*/&|^]?=)')
+_FP16_LIT = re.compile(r'^-?\d+\.\d+(?:e[+-]?\d+)?f?$')
+
+
+def _fp16_pair_expr(ax, ay, unpacks):
+    """Given scalar lane operands (ax, ay), return a half2 MSL expression if both come from the same pure half2 unpack or are float literals; else None."""
+    if _FP16_LIT.match(ax) and _FP16_LIT.match(ay):
+        return f'half2({ax}, {ay})'
+    ux, uy = unpacks.get(ax), unpacks.get(ay)
+    if ux and uy and ux[0] == uy[0] and ux[1] == 'x' and uy[1] == 'y':
+        return f'as_type<half2>({ux[0]})'
+    return None
+
+
+def fp16_pack_chains(msl):
+    """Fold single-use scalarized unpack-op-pack half2 chains into native Metal half2 vector instructions. Unchanged when no pack pattern exists."""
+    if 'half2(float2(' not in msl or 'float2(as_type<half2>(' not in msl:
+        return msl
+    uses = {}
+    for m in _FP16_IDENT.finditer(msl):
+        v = m.group(1)
+        uses[v] = uses.get(v, 0) + 1
+    lines = msl.split('\n')
+    # Track active definitions within the current basic block (cleared at control flow / brace boundaries).
+    unpacks = {}   # var -> (pure_src_expr, lane, line_idx, deps_set)
+    ops = {}       # var -> (kind, args_tuple, line_idx, ind, deps_set)
+    drop = set()
+    changed = False
+    for idx, ln in enumerate(lines):
+        st = ln.strip()
+        if not st or st.startswith('//'):
+            continue
+        # Any control-flow keyword or block brace resets basic-block tracking.
+        if '{' in st or '}' in st or re.match(r'^(?:if|else|for|while|do|switch|case|default|return|break|continue|discard_fragment)\b', st):
+            unpacks.clear()
+            ops.clear()
+            continue
+        m_u = _FP16_UNPACK.match(ln)
+        if m_u:
+            src = m_u.group('src').strip()
+            var = m_u.group('var')
+            if _FP16_PURE.match(src):
+                deps = set(_FP16_IDENT.findall(src))
+                unpacks[var] = (src, m_u.group('lane'), idx, deps)
+            else:
+                unpacks.pop(var, None)
+            ops.pop(var, None)
+            continue
+        m_b = _FP16_BIN.match(ln)
+        if m_b:
+            var = m_b.group('var')
+            a, op, b = m_b.group('a'), m_b.group('op'), m_b.group('b')
+            deps = {x for x in (a, b) if x.startswith('_')}
+            ops[var] = ('bin', (op, a, b), idx, m_b.group('ind'), deps)
+            unpacks.pop(var, None)
+            continue
+        m_f = _FP16_FMA.match(ln)
+        if m_f:
+            var = m_f.group('var')
+            a, b, c = m_f.group('a'), m_f.group('b'), m_f.group('c')
+            deps = {x for x in (a, b, c) if x.startswith('_')}
+            ops[var] = ('fma', (a, b, c), idx, m_f.group('ind'), deps)
+            unpacks.pop(var, None)
+            continue
+        m_p = _FP16_PACK.match(ln)
+        if m_p:
+            vx, vy = m_p.group('x'), m_p.group('y')
+            ox, oy = ops.get(vx), ops.get(vy)
+            # Each scalar result must have exactly 2 mentions total: its declaration + this single pack use.
+            if ox and oy and ox[0] == oy[0] and ox[3] == m_p.group('ind') and oy[3] == m_p.group('ind') and uses.get(vx) == 2 and uses.get(vy) == 2:
+                expr = None
+                used_unpacks = ()
+                if ox[0] == 'bin' and ox[1][0] == oy[1][0]:
+                    op, ax, bx = ox[1]
+                    _, ay, by = oy[1]
+                    ea = _fp16_pair_expr(ax, ay, unpacks)
+                    eb = _fp16_pair_expr(bx, by, unpacks)
+                    if ea and eb:
+                        expr = f'({ea} {op} {eb})'
+                        used_unpacks = (ax, ay, bx, by)
+                elif ox[0] == 'fma':
+                    ax, bx, cx = ox[1]
+                    ay, by, cy = oy[1]
+                    ea = _fp16_pair_expr(ax, ay, unpacks)
+                    eb = _fp16_pair_expr(bx, by, unpacks)
+                    ec = _fp16_pair_expr(cx, cy, unpacks)
+                    if ea and eb and ec:
+                        expr = f'fma({ea}, {eb}, {ec})'
+                        used_unpacks = (ax, ay, bx, by, cx, cy)
+                if expr:
+                    lines[idx] = f"{m_p.group('ind')}{m_p.group('lhs')}as_type<uint>({expr});"
+                    drop.add(ox[2])
+                    drop.add(oy[2])
+                    for uvar in used_unpacks:
+                        if uvar in unpacks and uses.get(uvar) == 2:
+                            drop.add(unpacks[uvar][2])
+                    changed = True
+            # Invalidate whatever LHS variable was written by the pack line.
+            m_as = _FP16_ASSIGN.match(ln)
+            if m_as:
+                w = m_as.group(1)
+                unpacks = {k: v for k, v in unpacks.items() if k != w and w not in v[3]}
+                ops = {k: v for k, v in ops.items() if k != w and w not in v[4]}
+            continue
+        # Any other assignment invalidates tracked defs depending on the written variable.
+        m_as = _FP16_ASSIGN.match(ln)
+        if m_as:
+            w = m_as.group(1)
+            unpacks = {k: v for k, v in unpacks.items() if k != w and w not in v[3]}
+            ops = {k: v for k, v in ops.items() if k != w and w not in v[4]}
+    if not changed:
+        return msl
+    return '\n'.join(ln for i, ln in enumerate(lines) if i not in drop)

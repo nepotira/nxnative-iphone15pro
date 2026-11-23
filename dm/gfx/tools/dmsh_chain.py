@@ -78,7 +78,7 @@ XLATE_DIR = os.path.dirname(os.environ.get('XLATE', os.path.join(HERE, 'dmsh_xla
 SPIRV_CROSS = os.environ.get('SPIRV_CROSS', os.path.join(HERE, 'spirv_cross_bin/spirv-cross'))
 
 def storage_constant_mode():
-    return os.environ.get('DMSH_SCONST', 'fp')
+    return os.environ.get('DMSH_SCONST', 'fp,vp,cp,mp')
 
 def options():
     return 'debug=%s reduced=%s sconst=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1', storage_constant_mode())

@@ -899,6 +899,7 @@ def finish(key, w, j, c1):
     read_only = {i for i, b in enumerate(sorted(res['sbufs'], key=lambda b: b['binding']))
                  if not b['flags'] & 1 and b['cb_slot'] != abi.GMEM_MAP_CB_SLOT}   # BufferUsageFlags.Write (includes atomics)
     src = dmsh_wide.constant_reads(src, read_only, dmsh_chain.storage_constant_mode())
+    src = dmsh_rewrite.fp16_pack_chains(src)   # collapse scalarized half2 unpack-op-pack chains into native Apple AGX half2 SIMD ops
     src = dmsh_rewrite.tg_fence(src)   # warp-synchronous shared memory: the translator's dmsh_tg_fence() as a simdgroup-scope fence (see tg_fence)
     src = dmsh_rewrite.border_emu(src)   # border colours Metal lacks (see border_emu)
     if j['stage'] == 'ps': src = dmsh_rewrite.frag_z_snap(src)[0]   # gl_FragCoord.z against a depth of its own surface (see frag_z_snap)
