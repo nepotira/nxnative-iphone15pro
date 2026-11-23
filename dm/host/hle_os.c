@@ -44,10 +44,11 @@ void *objmap_del(const void *k) {
     pthread_mutex_unlock(&g_om_lock);
     return r;
 }
+static mach_timebase_info_data_t g_os_tb;
+__attribute__((constructor)) static void os_clock_init(void) { mach_timebase_info(&g_os_tb); }
 uint64_t now_ns(void) {
-    static mach_timebase_info_data_t tb;
-    if (!tb.denom) mach_timebase_info(&tb);
-    return mach_absolute_time() * tb.numer / tb.denom;
+    if (__builtin_expect(!g_os_tb.denom, 0)) mach_timebase_info(&g_os_tb);
+    return mach_absolute_time() * g_os_tb.numer / g_os_tb.denom;
 }
 // Guest clock: the system counters the guest can read (mrs cntpct gate, svc GetSystemTick) all go through here. Default = now_ns().
 // Freeze (only for the test driver DM_TICK_HOLD): while frozen the guest clock does not advance ⇒ the game's next tick never comes due; after unfreezing the frozen duration is subtracted, the guest clock is continuous with no jump
@@ -96,6 +97,7 @@ static pthread_mutex_t g_gfz_mu = PTHREAD_MUTEX_INITIALIZER; static unsigned g_g
 // frames as its period, got 0, and the next frame's loop that steps by it (main+0x9abd0) never ended. Guest reads of the system counter (the cntpct gate, svc GetSystemTick) wait while
 // the app is in the background (reason 1); host work (dm_host_work: inside a submit or present, which the graphics suspend waits for) reads the frozen clock, as do the other reasons
 static pthread_cond_t g_gfz_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_gfz_bg;
+_Atomic int dm_clock_bg_frozen;   // read by entry.S _dm_gate cntpct fast-path (0 = safe to read clock without blocking/mutex)
 // Each read also counts on the reading thread: a run of yields whose passes read the clock is a wait for a time, which the yield back-off sleeps from its start (hle_thread.c thr_yield)
 __thread uint64_t dm_clock_reads;
 void guest_clock_read_wait(void) {
@@ -105,11 +107,22 @@ void guest_clock_read_wait(void) {
     while (g_gfz_reasons & 2u) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
     pthread_mutex_unlock(&g_gfz_mu);
 }
+// Lock-free integer-only cntpct/cntvct fast-path called by entry.S _dm_gate (no NEON/FP state saved by caller).
+// Returns (ticks, 1) in (x0, x1) on the fast path, or (0, 0) if a background freeze raced in and entry.S must fall back to the full gate.
+typedef struct { uint64_t ticks, ok; } dm_cntpct_res_t;
+dm_cntpct_res_t dm_cntpct_fast(void) {
+    if (__builtin_expect(atomic_load_explicit(&g_gfz_bg, memory_order_acquire) &&
+                         !atomic_load_explicit(&dm_host_work, memory_order_relaxed), 0))
+        return (dm_cntpct_res_t){0, 0};
+    dm_clock_reads++;
+    return (dm_cntpct_res_t){guest_ticks(), 1};
+}
 void guest_clock_freeze_for(int reason, int on) {
     pthread_mutex_lock(&g_gfz_mu);
     if (on) g_gfz_reasons |= 1u << reason; else g_gfz_reasons &= ~(1u << reason);
     guest_clock_freeze_apply(g_gfz_reasons != 0);
     atomic_store(&g_gfz_bg, (g_gfz_reasons & 2u) != 0);
+    atomic_store_explicit(&dm_clock_bg_frozen, (g_gfz_reasons & 2u) != 0, memory_order_release);
     if (!(g_gfz_reasons & 2u)) pthread_cond_broadcast(&g_gfz_cv);   // after the clock is running again: a released read sees it continue
     pthread_mutex_unlock(&g_gfz_mu);
 }

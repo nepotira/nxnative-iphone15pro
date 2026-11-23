@@ -80,7 +80,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Persona 5 Strikers](#persona-5-strikers) | 0 | 0 | 0 | 1 | 0 | `game` |
 | [Pokémon Legends: Arceus](#pokémon-legends-arceus) | 0 | 0 | 0 | 1 | 0 | `game` |
 | [Super Mario 3D All-Stars: Super Mario Sunshine](#super-mario-3d-all-stars-super-mario-sunshine) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [Super Mario Odyssey](#super-mario-odyssey) | 0 | 0 | 4 | 0 | 1 | `build` → `game` |
+| [Super Mario Odyssey](#super-mario-odyssey) | 0 | 0 | 4 | 0 | 0 | `build` → `game` |
 | [Super Smash Bros. Ultimate](#super-smash-bros-ultimate) | 11 | 0 | 0 | 1 | 0 | `game` |
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 43 | 0 | 0 | `build` → `game` ×2 |
@@ -511,7 +511,6 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - frame step `+0x74d2ec`: camera projection: widen 16:9 framebuffer aspect to active drawable ratio (ASPECT_STATE)
   - frame step `+0x908c3c`: full-screen fades and backdrops: widen 1280x720 non-RootPane quads to cover widened ortho space
   - launcher capabilities: CAMERA_ASPECT
-  - host [loader.c:406](../../dm/host/loader.c#L406): build check
 
 ### Super Smash Bros. Ultimate
 

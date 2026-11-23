@@ -184,6 +184,8 @@
 #define DMSH_ROUND_8 1                   // 8 bits a channel (255)
 #define DMSH_ROUND_16 2                  // 16 bits a channel (65535)
 #define DMSH_ROUND_10_2 3                // 10 bits rgb, 2 bits alpha (1023, 3)
+// Function constant (bool, fragment stage): true dead-code-eliminates dm_blend0 (dm_bz, dm_rop and the dm_blend buffer load) when the pipeline's target formats and blend state need neither
+#define DMSH_BLEND_FC 234
 
 // Border colours Metal has no sampler state for (it has transparent black, opaque black and opaque white): the build gives each sampler member a shader samples through a twin,
 // <member>_w, and the shader a block it reads per sample, r + (twin sample - r) * k when the sampler's bit is set (dmsh_rewrite.py border_emu, nvn_border.h)

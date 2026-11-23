@@ -30,4 +30,19 @@ def BEQ(frm, to):
     return 0x54000000 | (((off >> 2) & 0x7FFFF) << 5)
 def BRK(imm): return 0xD4200000 | ((imm & 0xFFFF) << 5)
 def BLR(n): return 0xD63F0000 | (n << 5)
+def MOVZ32(dd, imm16): return 0x52800000 | ((imm16 & 0xFFFF) << 5) | dd
+def MOVN32(dd, imm16): return 0x12800000 | ((imm16 & 0xFFFF) << 5) | dd
+def MOVZ64(dd, imm16): return 0xD2800000 | ((imm16 & 0xFFFF) << 5) | dd
+def MOVN64(dd, imm16): return 0x92800000 | ((imm16 & 0xFFFF) << 5) | dd
+def MOVW_ZR(dd): return 0x2A1F03E0 | dd
+def LDADDAL32(rs, rt, rn): return 0xB8E00000 | (rs << 16) | (rn << 5) | rt
+def LDADDAL64(rs, rt, rn): return 0xF8E00000 | (rs << 16) | (rn << 5) | rt
+def LDCLRAL32(rs, rt, rn): return 0xB8E01000 | (rs << 16) | (rn << 5) | rt
+def LDCLRAL64(rs, rt, rn): return 0xF8E01000 | (rs << 16) | (rn << 5) | rt
+def LDEORAL32(rs, rt, rn): return 0xB8E02000 | (rs << 16) | (rn << 5) | rt
+def LDEORAL64(rs, rt, rn): return 0xF8E02000 | (rs << 16) | (rn << 5) | rt
+def LDSETAL32(rs, rt, rn): return 0xB8E03000 | (rs << 16) | (rn << 5) | rt
+def LDSETAL64(rs, rt, rn): return 0xF8E03000 | (rs << 16) | (rn << 5) | rt
+def SWPAL32(rs, rt, rn): return 0xB8E08000 | (rs << 16) | (rn << 5) | rt
+def SWPAL64(rs, rt, rn): return 0xF8E08000 | (rs << 16) | (rn << 5) | rt
 NOP = 0xD503201F
