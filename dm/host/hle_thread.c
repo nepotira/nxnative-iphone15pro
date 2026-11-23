@@ -20,6 +20,7 @@
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include <TargetConditionals.h>
 
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -86,6 +87,7 @@ typedef struct thr {
     mach_port_t mport;         // Host thread port (to get CPU time)
     _Atomic int qos_pending;   // SetThreadPriority from another thread changed prio: the thread applies the new class at its next SVC (only a thread can set its own QoS)
     uint32_t qos;
+    int interactive_promoted;  // promoted to USER_INTERACTIVE on first NVN submit/acquire (DM_NVN_QOS_PROMOTE) so guest render threads above e1 stay on P-cores under DM_QOS_MAP=1
     // Pausing (SetThreadActivity, used by IL2CPP's garbage collector to stop the world): pause_req = requested, paused = stopped for the current request; when stopped inside an SVC the context comes from the gate frame svc_regs (registered on SVC entry),
     // when stopped in guest code the signal handler saves it into ctx_*; pcv lets the requester wait for "stopped" and the paused thread wait for "resume"
     _Atomic int pause_req; int paused;
@@ -405,12 +407,32 @@ static qos_class_t prio_qos(int prio) {
     return prio <= g_qos_e1 ? QOS_CLASS_USER_INTERACTIVE : prio <= g_qos_e2 ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
 }
 static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and qos are shared with scheduler readers)
-    qos_class_t q = prio_qos(t->prio);
+    qos_class_t q = t->interactive_promoted ? QOS_CLASS_USER_INTERACTIVE : prio_qos(t->prio);
     if ((uint32_t)q != t->qos && !pthread_set_qos_class_self_np(q, 0)) t->qos = (uint32_t)q;
 }
 // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
 void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
 static const char *thr_name(thr_t *t, char *buf, size_t n);
+// Auto-promote guest render threads that actively submit NVN commands or acquire swapchain textures to USER_INTERACTIVE under DM_QOS_MAP=1
+// (e.g. SMO's render thread at priority 45 > e1=44), without raising background workers. Fast TLS flag: zero lock/overhead after first call.
+void dm_thread_promote_interactive(void) {
+    static __thread int t_done;
+    if (t_done) return;
+    t_done = 1;
+    if (!g_qos_map) return;
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_NVN_QOS_PROMOTE"); on = !e || atoi(e) != 0; }
+    if (!on) return;
+    thr_t *t = pthread_getspecific(g_keythr);
+    if (!t) return;
+    g_lock();
+    int was_demoted = t->qos != (uint32_t)QOS_CLASS_USER_INTERACTIVE;
+    t->interactive_promoted = 1;
+    qos_apply(t);
+    char nb[48];
+    if (was_demoted) LOG("DM_NVN_QOS_PROMOTE: promoted guest render thread %#x '%s' (priority %d) to USER_INTERACTIVE", t->handle, thr_name(t, nb, sizeof nb), t->prio);
+    g_unlock();
+}
 static void thread_exit(thr_t *t);
 static void *thread_main(void *p) {
     thr_t *t = p;
@@ -971,8 +993,14 @@ static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict) {
 #define SPIN_GAP_NS 20000
 void dm_spin_wait(uint64_t gate, uint64_t site) {
     static int on = -1; static uint64_t poll_ns;
-    if (on < 0) { const char *e = getenv("DM_SPIN"), *p = getenv("DM_SPIN_POLL"); poll_ns = (p && *p ? strtoull(p, 0, 10) : 2000) * 1000; on = !(e && *e && atoi(e) == 0);
-                  if (!on) LOG("DM_SPIN=0: spin waits do not yield or sleep"); else if (p && *p) LOG("DM_SPIN_POLL: spin waits poll for %llu µs, then yield", (unsigned long long)(poll_ns / 1000)); }
+    if (on < 0) { const char *e = getenv("DM_SPIN"), *p = getenv("DM_SPIN_POLL");
+#if TARGET_OS_IPHONE
+        uint64_t def_us = 400;
+#else
+        uint64_t def_us = 2000;
+#endif
+        poll_ns = (p && *p ? strtoull(p, 0, 10) : def_us) * 1000; on = !(e && *e && atoi(e) == 0);
+        if (!on) LOG("DM_SPIN=0: spin waits do not yield or sleep"); else if (p && *p) LOG("DM_SPIN_POLL: spin waits poll for %llu µs, then yield", (unsigned long long)(poll_ns / 1000)); }
     thr_t *me = pthread_getspecific(g_keythr);
     if (!me) return;
     uint64_t now = now_ns();
