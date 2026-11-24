@@ -21901,6 +21901,10 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (atomic_load(&g_gpu_lost) || atomic_load(&g_present_suspended)) return 0;
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
+#if TARGET_OS_IPHONE
+    BOOL want_fbo = (fx_mode() != 1);   // framebufferOnly=YES enables TBDR display compression when presenting via render pass; NO lets MetalFX (DM_PRESENT_UPSCALE=metalfx) write directly to the drawable
+    if (layer.framebufferOnly != want_fbo) layer.framebufferOnly = want_fbo;
+#endif
 #if TARGET_OS_OSX
     if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // Windowed mode follows the display's vsync to prevent tearing
 #endif

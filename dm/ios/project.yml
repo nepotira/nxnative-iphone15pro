@@ -63,30 +63,34 @@ targets:
               - UISceneConfigurationName: TV
                 UISceneDelegateClassName: DmTVSceneDelegate
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: ${DM_BUNDLE_ID}
-      PRODUCT_NAME: DmIOS
-      MARKETING_VERSION: ${DM_APP_VERSION}         # the game's display version: the packed update's, else the base game's (set by build_ipa.sh)
-      CURRENT_PROJECT_VERSION: ${DM_APP_VERSION}
-      DEVELOPMENT_TEAM: ${DM_TEAM_ID}
-      CODE_SIGN_STYLE: Automatic
-      ENABLE_USER_SCRIPT_SANDBOXING: NO    # the game's files live on the external drive
-      DM_COPY_GAME_RESOURCES: YES          # build_ipa.sh overrides this only for its unsigned archive build
-      SYMROOT: $(DM_XCODE_OUTPUT_ROOT)/Build/Products
-      OBJROOT: $(DM_XCODE_OUTPUT_ROOT)/Build/Intermediates.noindex
-      # Workspaces can override SYMROOT/OBJROOT. Keep app bundles and compiles separate even then.
-      CONFIGURATION_BUILD_DIR: $(DM_XCODE_OUTPUT_ROOT)/Build/Products/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)
-      CONFIGURATION_TEMP_DIR: $(DM_XCODE_OUTPUT_ROOT)/Build/Intermediates.noindex/$(PROJECT_NAME).build/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)
-      ASSETCATALOG_COMPILER_APPICON_NAME: $(DM_APPICON)   # Gen/dm.xcconfig sets DM_APPICON = AppIcon when there is a game icon; empty = no icon (xcodegen's default is AppIcon, which fails the build when the catalog lacks it)
-      TARGETED_DEVICE_FAMILY: "1,2"
-      ENABLE_BITCODE: NO
-      GCC_C_LANGUAGE_STANDARD: gnu11
-      OTHER_CFLAGS: $(inherited) -mcpu=apple-m1   # the oldest chip the app supports (an M1 iPad; iPhones from the A17 Pro, as the games need BC textures), the Mac build's default too: it has the LSE atomics the host assembly uses, which the default baseline does not accept. Not newer: dav1d turns on every feature the target promises, and the A18 target (its I8MM) stopped an M1 iPad with SIGILL in the AV1 decoder (dm/ios/tests/test_cpu_target.py)
-      OTHER_LDFLAGS: $(inherited) -lz
-      CLANG_ENABLE_OBJC_ARC: YES
-      SWIFT_VERSION: "5.0"                         # Launcher.swift (SwiftUI)
-      SWIFT_OBJC_BRIDGING_HEADER: Sources/DmIOS-Bridging-Header.h   # CloudSaves.h (the cloud-save folder pick)
-      DEBUG_INFORMATION_FORMAT: dwarf
-      GCC_WARN_INHIBIT_ALL_WARNINGS: YES
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ${DM_BUNDLE_ID}
+        PRODUCT_NAME: DmIOS
+        MARKETING_VERSION: ${DM_APP_VERSION}         # the game's display version: the packed update's, else the base game's (set by build_ipa.sh)
+        CURRENT_PROJECT_VERSION: ${DM_APP_VERSION}
+        DEVELOPMENT_TEAM: ${DM_TEAM_ID}
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_USER_SCRIPT_SANDBOXING: NO    # the game's files live on the external drive
+        DM_COPY_GAME_RESOURCES: YES          # build_ipa.sh overrides this only for its unsigned archive build
+        SYMROOT: $(DM_XCODE_OUTPUT_ROOT)/Build/Products
+        OBJROOT: $(DM_XCODE_OUTPUT_ROOT)/Build/Intermediates.noindex
+        # Workspaces can override SYMROOT/OBJROOT. Keep app bundles and compiles separate even then.
+        CONFIGURATION_BUILD_DIR: $(DM_XCODE_OUTPUT_ROOT)/Build/Products/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)
+        CONFIGURATION_TEMP_DIR: $(DM_XCODE_OUTPUT_ROOT)/Build/Intermediates.noindex/$(PROJECT_NAME).build/$(CONFIGURATION)$(EFFECTIVE_PLATFORM_NAME)
+        ASSETCATALOG_COMPILER_APPICON_NAME: $(DM_APPICON)   # Gen/dm.xcconfig sets DM_APPICON = AppIcon when there is a game icon; empty = no icon (xcodegen's default is AppIcon, which fails the build when the catalog lacks it)
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_BITCODE: NO
+        GCC_C_LANGUAGE_STANDARD: gnu11
+        OTHER_CFLAGS: $(inherited) -mcpu=apple-m1   # the oldest chip the app supports (an M1 iPad; iPhones from the A17 Pro, as the games need BC textures), the Mac build's default too: it has the LSE atomics the host assembly uses, which the default baseline does not accept. Not newer: dav1d turns on every feature the target promises, and the A18 target (its I8MM) stopped an M1 iPad with SIGILL in the AV1 decoder (dm/ios/tests/test_cpu_target.py)
+        OTHER_LDFLAGS: $(inherited) -lz
+        CLANG_ENABLE_OBJC_ARC: YES
+        SWIFT_VERSION: "5.0"                         # Launcher.swift (SwiftUI)
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/DmIOS-Bridging-Header.h   # CloudSaves.h (the cloud-save folder pick)
+        DEBUG_INFORMATION_FORMAT: dwarf
+        GCC_WARN_INHIBIT_ALL_WARNINGS: YES
+      configs:
+        Release:
+          GCC_OPTIMIZATION_LEVEL: "2"                # -O2 instead of Xcode's default -Os for hot C/Obj-C replay, HLE, and video decode paths (never -flto: hle_bigstack.c SIGBUS)
 schemes:
   ${DM_SCHEME_NAME}:
     build:

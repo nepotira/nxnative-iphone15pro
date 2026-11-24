@@ -1,6 +1,6 @@
 """Offer the resolution control only when the rewritten build supports it, and the game's upscaler choice only to games whose shader map holds their own upscaler (an NDSR pack's network: game.py upscaler_keys)."""
 from pathlib import Path
-import sys,tempfile,unittest
+import os,sys,tempfile,unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'games'))
 import settings
@@ -48,6 +48,9 @@ class UpscalerSetting(unittest.TestCase):
             for gid,shown in [('040074A01BF12000',True),('040077201BE50000',True),('010056B015FE8000',False)]:   # Donkey Kong Bananza (agl's NDSR pack), Kirby Air Riders (the pack under its own name), NieR:Automata (none)
                 up=[s for s in settings.build(gid,tmp,'unused')['settings'] if s['env']=='DM_UPSCALER']
                 self.assertEqual(bool(up),shown,gid)
-                if up:self.assertEqual((up[0]['default'],up[0]['options']),('game',[['game',"Game's own"],['metalfx','MetalFX']]))
+                if up:self.assertEqual((up[0]['default'],up[0]['options']),('metalfx',[['game',"Game's own"],['metalfx','MetalFX']]))
+            with patch.dict(os.environ,{'SETTINGS_PLATFORM':'mac'}):
+                up=[s for s in settings.build('040074A01BF12000',tmp,'unused')['settings'] if s['env']=='DM_UPSCALER']
+                self.assertEqual(up[0]['default'],'game')
 
 if __name__=='__main__':unittest.main()
