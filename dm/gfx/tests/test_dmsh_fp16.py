@@ -88,6 +88,9 @@ class Fp16PackChains(unittest.TestCase):
 
     def test_mutated_source_is_not_folded(self):
         self.assertEqual(dmsh_rewrite.fp16_pack_chains(MUTATED_SRC), MUTATED_SRC)
+        for mut in ('    _10 <<= 1u;', '    _10 >>= 1u;', '    _10 %= 3u;', '    _10++;', '    --_10;'):
+            src = MUTATED_SRC.replace('    _10 = _10 + 1u;', mut)
+            self.assertEqual(dmsh_rewrite.fp16_pack_chains(src), src, f'should not fold across {mut.strip()}')
 
     def test_shared_unpack_keeps_live_lane(self):
         out = dmsh_rewrite.fp16_pack_chains(SHARED_LANE)

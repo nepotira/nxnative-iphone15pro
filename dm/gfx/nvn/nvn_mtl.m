@@ -6854,7 +6854,7 @@ static id<MTLRenderPipelineState> g_enc_pso; static id<MTLDepthStencilState> g_e
 // Dynamic state already sent on the open render encoder: each draw used to send all nine (stencil reference, viewport, scissor, cull, winding, fill, depth bias, depth clip, blend colour);
 // now a value is sent only when it differs. g_ed.ok holds one bit per item and is cleared for every new encoder and after a clear triangle (which sets its own). Depth bounds are
 // the exception: a new encoder starts with the test off (rp_begin_ex sets ED_DBND with (0, 1)), and an in-pass clear triangle resets them itself, so neither costs a call
-static struct { unsigned ok; uint32_t sref, sref_b; MTLViewport vp; MTLScissorRect sc; int cull, wind, fill, clip; float bias[3], blend[4], dbnd[2]; uint8_t pos_far, wl, sc_empty, cull_both; } g_ed;
+static struct { unsigned ok; uint32_t sref, sref_b; MTLViewport vp; MTLScissorRect sc; int cull, wind, fill, clip; float bias[3], blend[4], dbnd[2]; uint8_t pos_far, wl, sc_empty, cull_both, origin_ll; } g_ed;
 enum { ED_SREF = 1, ED_VP = 2, ED_SC = 4, ED_CULL = 8, ED_WIND = 16, ED_FILL = 32, ED_BIAS = 64, ED_CLIP = 128, ED_BLEND = 256, ED_ALL_DYN = 511, ED_DBND = 512 };
 enum { DYN_SREF = 1, DYN_VP = 2, DYN_SC = 4, DYN_POLY = 8, DYN_BLEND = 16, DYN_ALL = 31 };
 static uint32_t g_dyn_dirty = DYN_ALL;
@@ -9125,7 +9125,7 @@ static int g_spool_n; static uint64_t g_stat_samp_oob;
 static _Atomic int g_origin_ll;
 void mtl_set_origin_lower_left(int on) { if (atomic_exchange(&g_origin_ll, on) != on) MLOG("window origin: %s", on ? "lower left (GL: viewport flipped, winding reversed, present flipped)" : "upper left"); }
 static int g_queue_origin_ll;   // SET_WINDOW_ORIGIN's raster flip is queue state, independent of later device-origin changes.
-void mtl_set_queue_origin_lower_left(int on) { g_queue_origin_ll = on != 0; }
+void mtl_set_queue_origin_lower_left(int on) { int v = on != 0; if (v != g_queue_origin_ll) { g_queue_origin_ll = v; g_dyn_dirty |= DYN_VP | DYN_POLY; } }
 void mtl_set_tex_pool_n(int n) { g_tpool_n = n; }
 void mtl_set_samp_pool_n(int n) { g_spool_n = n; }
 static id<MTLTexture> treg_tex(const treg_t *r) { return r->gone ? tex_made(&r->t) : tex_mtl(&r->t); }   // Caller holds g_rmu
@@ -10991,19 +10991,7 @@ static uint32_t bz_word(const uint8_t *lm) { return bz_word_for(g_pass.cfmt, lm,
 // MAX on both its colour and alpha (they keep one of two stored values, so a colour rounded first keeps the same one), or a logic operation (which takes the place of blending and
 // rounds the colour as the target stores it; dmsh_logic.py dm_logic_norm then finds it exact). sRGB, signed, float, packed 16-bit formats and blended sums (rounded after the blend,
 // out of a shader's reach) keep Apple's conversion. DM_NVN_ROP_ROUND=0 gives 0 for every draw, for A/B runs
-static int rop_on(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("DM_NVN_ROP_ROUND");
-#if TARGET_OS_IPHONE
-        v = (e && !strcmp(e, "1")) ? 1 : 0;   // iOS defaults off so upstream dm_blend_off eliminates per-pixel rint/clamp/div ALU on normalized targets; set DM_NVN_ROP_ROUND=1 if a game needs exact NVIDIA half-step flags
-#else
-        v = !(e && !strcmp(e, "0"));
-#endif
-        if (!v) MLOG("DM_NVN_ROP_ROUND=0: colours go into normalized targets as Apple's GPU converts them");
-    }
-    return v;
-}
+static int rop_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ROP_ROUND"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_ROP_ROUND=0: colours go into normalized targets as Apple's GPU converts them"); } return v; }
 static uint32_t rop_class(MTLPixelFormat f) {
     switch (f) {
         case MTLPixelFormatR8Unorm: case MTLPixelFormatRG8Unorm: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatBGRA8Unorm: return DMSH_ROUND_8;
@@ -17695,7 +17683,7 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
     typedef struct { uint64_t rec, ib, out, args; uint32_t prim, isz, ilen, cap; } ejob;
     id<MTLBuffer> ab; size_t ao = arena_alloc((size_t)n * (32 + sizeof(ajob)), &ab); uint64_t ag = ab.gpuAddress + ao;   // n argument records (32 bytes apart), then the arrays jobs
     ajob *aj = (ajob *)((uint8_t *)ab.contents + ao + (size_t)n * 32);
-    id<MTL4ComputeCommandEncoder> ce = blit(); if (g_blit_ops) blit_barrier();
+    id<MTL4ComputeCommandEncoder> ce = blit();
     [ce setArgumentTable:at]; g_blit_ct = 0;
     for (int i = 0; i < n; i++) {
         ixc_ent *e = &g_ixc[n0 + i]; uint64_t rec, ib = 0; void *mb; uint64_t mo; e->args = 0;
@@ -18083,7 +18071,7 @@ static void wide_run(const p_draw_idx *di) {
     if (g_enc) { g_wide_splits++; PD("M %llu 8-bit index GPU expansion: render pass split here", g_stat_pass); rp_end(); }
     typedef struct { uint64_t src, dst; uint32_t n, shift; } wjob;
     id<MTLBuffer> jb; size_t jo = arena_alloc((size_t)n * sizeof(wjob), &jb); wjob *jp = (wjob *)((uint8_t *)jb.contents + jo);
-    id<MTL4ComputeCommandEncoder> ce = blit(); if (g_blit_ops) blit_barrier();
+    id<MTL4ComputeCommandEncoder> ce = blit();
     [ce setArgumentTable:at]; g_blit_ct = 0; [ce setComputePipelineState:ps];
     for (int i = 0; i < n; i++) {
         wide_ent *e = &g_wide[n0 + i]; void *mb; uint64_t mo, src; e->gpu = 0;
@@ -18276,7 +18264,7 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
     for (int k = 0; k < nq; k++) { mdx_ent *e = q[k].e; void *mb; uint64_t mo, rg, cg;
         if (!mtl_gpu_addr(e->ind, 4 * (q[k].words ? q[k].words : 2), &mb, &mo, &rg) || !mtl_gpu_addr(e->cnt, 4, &mb, &mo, &cg)) continue;
         e->out = og + 32 * (uint64_t)k; j[k] = (mjob){rg, cg, e->out, q[k].i, q[k].words}; }
-    id<MTL4ComputeCommandEncoder> ce = blit(); if (g_blit_ops) blit_barrier();
+    id<MTL4ComputeCommandEncoder> ce = blit();
     [ce setArgumentTable:at]; g_blit_ct = 0; at_addr(at, ab.gpuAddress + ao, 0, "multi-draw indirect table slot", 0); [ce setComputePipelineState:ps];
     [ce dispatchThreadgroups:MTLSizeMake((NSUInteger)nj / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     g_dw_lo[0] = 0; g_dw_hi[0] = ~0ull; g_dw_n = 1; g_dr_lo[0] = 0; g_dr_hi[0] = ~0ull; g_dr_n = 1; g_blit_ops++;
@@ -18755,7 +18743,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     else if (g_fsp_pass) { cur_ps = nil; for (int i = 0; i < g_fsp_n && !cur_ps; i++) cur_ps = g_fsp_ps[i]; cur_pull = 0; cur_pr = nil; g_pso_dirty = 1; }   // a face-split draw: its pipelines (fsp_encode); the next draw fetches its own
     else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || border != cur_border) {
         uint64_t sg = g_ser_gen;
-        pso_l1_t *l1 = (!g_pso_lmap && !g_pso_fsfn) ? &g_pso_l1[(((uintptr_t)pr >> 4) ^ (uintptr_t)g_pso_state_gen) & 63u] : NULL;
+        pso_l1_t *l1 = (!g_pso_lmap && !g_pso_fsfn && !g_geo_program && S.prog && S.prog->serial && !ms_fs_override(pr->sh[1])) ? &g_pso_l1[(((uintptr_t)pr >> 4) ^ (uintptr_t)g_pso_state_gen) & 63u] : NULL;
         if (l1 && l1->pr == (__bridge const void *)pr && l1->pass_serial == g_pass.serial && l1->state_gen == g_pso_state_gen && l1->ser_gen == sg && l1->border == border && l1->sm_pass == g_sm_pass && l1->ps) {
             cur_ps = l1->ps; cur_pull = 0; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_border = border; g_pso_dirty = 0;
         } else {
@@ -18787,9 +18775,13 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     // Dynamic encoder state fast-path: when g_dyn_dirty == 0 and all dynamic slots are valid for this pass, skip all 9 state checks and 4 memcmps in one branch.
     uint8_t cur_pf = (pr->sh[0] && pr->sh[0]->rf.pos_far && !pr->sh[2] && !pr->sh[3] && !pr->sh[4]) ? 1 : 0;
     uint8_t cur_wl = g_wl.on ? 1 : 0;
+    uint8_t cur_oll = vp_origin_ll() ? 1 : 0;
     uint32_t dyn = g_dyn_dirty;
-    if ((g_ed.ok & ED_ALL_DYN) != ED_ALL_DYN) dyn = DYN_ALL;
-    else if (cur_pf != g_ed.pos_far || cur_wl != g_ed.wl) dyn |= DYN_POLY;
+    if ((g_ed.ok & ED_ALL_DYN) != ED_ALL_DYN) { dyn = DYN_ALL; g_ed.origin_ll = cur_oll; }
+    else {
+        if (cur_pf != g_ed.pos_far || cur_wl != g_ed.wl) dyn |= DYN_POLY;
+        if (cur_oll != g_ed.origin_ll) { dyn |= DYN_VP | DYN_POLY; g_ed.origin_ll = cur_oll; }
+    }
     if (dyn) {
         if (dyn & DYN_SREF) {
             uint32_t sr = S.st_ref[0], sb = S.st_ref[1];

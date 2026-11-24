@@ -1007,7 +1007,7 @@ _FP16_BIN = re.compile(r'^(?P<ind>[ \t]*)float\s+(?P<var>_\d+)\s*=\s*(?P<a>_\d+|
 _FP16_FMA = re.compile(r'^(?P<ind>[ \t]*)float\s+(?P<var>_\d+)\s*=\s*fma\((?P<a>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?),\s*(?P<b>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?),\s*(?P<c>_\d+|-?\d+\.\d+(?:e[+-]?\d+)?f?)\);$')
 _FP16_PACK = re.compile(r'^(?P<ind>[ \t]*)(?P<lhs>(?:uint\s+_\d+|_\d+)\s*=\s*)as_type<uint>\(half2\(float2\((?P<x>_\d+),\s*(?P<y>_\d+)\)\)\);$')
 _FP16_IDENT = re.compile(r'\b(_\d+)\b')
-_FP16_ASSIGN = re.compile(r'^\s*(?:[a-zA-Z0-9_<>]+\s+)?(_\d+)\s*(?:[+\-*/&|^]?=)')
+_FP16_ASSIGN = re.compile(r'^\s*(?:(?:[a-zA-Z0-9_<>]+\s+)?(_\d+)\s*(?:(?:<<|>>|[+\-*/%&|^])?=|\+\+|--)|(?:\+\+|--)\s*(_\d+))')
 _FP16_LIT = re.compile(r'^-?\d+\.\d+(?:e[+-]?\d+)?f?$')
 
 
@@ -1107,14 +1107,14 @@ def fp16_pack_chains(msl):
             # Invalidate whatever LHS variable was written by the pack line.
             m_as = _FP16_ASSIGN.match(ln)
             if m_as:
-                w = m_as.group(1)
+                w = m_as.group(1) or m_as.group(2)
                 unpacks = {k: v for k, v in unpacks.items() if k != w and w not in v[3]}
                 ops = {k: v for k, v in ops.items() if k != w and w not in v[4]}
             continue
         # Any other assignment invalidates tracked defs depending on the written variable.
         m_as = _FP16_ASSIGN.match(ln)
         if m_as:
-            w = m_as.group(1)
+            w = m_as.group(1) or m_as.group(2)
             unpacks = {k: v for k, v in unpacks.items() if k != w and w not in v[3]}
             ops = {k: v for k, v in ops.items() if k != w and w not in v[4]}
     if not changed:
