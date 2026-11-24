@@ -65,6 +65,11 @@ on:
         description: 'Optional: RomFS mod .zip URL or filename (leave empty to use secret PTBR_OVERLAY_URL; type "none" to skip)'
         required: false
         default: ''
+      extended_va:
+        description: 'Include com.apple.developer.kernel.extended-virtual-addressing entitlement (requires paid Apple Developer provisioning profile; leave false for free sideloading)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read     # to download an earlier run's shader bundle (shader_from_run)
@@ -496,12 +501,25 @@ jobs:
           PSO_GPUS_IN: ${{ inputs.pso_gpus }}
           DM_PSO_IOS_MIN: ${{ inputs.pso_ios_min }}
           DEVICE_TYPE: ${{ inputs.device_type }}
+          EXTENDED_VA: ${{ inputs.extended_va }}
         run: |
           set -euo pipefail
           extra=""
           if [ "$ALLOW_OTHER_METAL" = "true" ]; then extra="--allow-other-metal"; fi
           gpu="$PSO_GPUS_IN"
           if [ -n "$gpu" ]; then extra="$extra --gpu $gpu"; fi
+          if [ "$EXTENDED_VA" = "true" ]; then
+            cat > "$RUNNER_TEMP/extended-va.entitlements" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.developer.kernel.increased-memory-limit</key><true/>
+            <key>com.apple.developer.kernel.extended-virtual-addressing</key><true/>
+          </dict></plist>
+          PLIST
+            export DM_ENTITLEMENTS="$RUNNER_TEMP/extended-va.entitlements"
+            echo "DM_ENTITLEMENTS=$DM_ENTITLEMENTS (increased-memory-limit + extended-virtual-addressing)"
+          fi
           python3 scripts/build_ipa_from_nsp.py "$WORK_DIR" \
             -k "$HOME/.switch/prod.keys" --progress lines --romfs "$ROMFS_MODE" $extra
 
