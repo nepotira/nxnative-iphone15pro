@@ -2656,6 +2656,10 @@ static void power_line(uint64_t frame) {
         if (gn != pgn) LOG("[nvn] GPU texture storage up to frame %llu: %llu regions, %.1f MB written into their storage on the GPU (%.2f regions, %.2f MB per frame)",
             frame, (unsigned long long)(gn - pgn), (gb - pgb) / 1048576.0, (gn - pgn) / nf, (gb - pgb) / 1048576.0 / nf);
         pgn = gn; pgb = gb;
+        void mtl_tbdr_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *); static uint64_t ptf, ptd, ptb, pml; uint64_t tf, td, tb, ml; mtl_tbdr_stats(&tf, &td, &tb, &ml);
+        if (tf != ptf || td != ptd || ml != pml) LOG("[nvn] TBDR opts up to frame %llu: MSAA resolves fused %llu (%.2f/frame), transient depth/stencil stores elided %llu (%.1f MB, %.2f MB/frame), memoryless materializations %llu",
+            frame, (unsigned long long)(tf - ptf), (tf - ptf) / nf, (unsigned long long)(td - ptd), (tb - ptb) / 1048576.0, (tb - ptb) / 1048576.0 / nf, (unsigned long long)(ml - pml));
+        ptf = tf; ptd = td; ptb = tb; pml = ml;
         char tc[400]; dm_thread_cpu(tc, sizeof tc, s);
         LOG("[nvn] threads up to frame %llu: CPU %s", frame, tc); }
     else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines

@@ -495,6 +495,7 @@ static void res_q_put(id<MTLAllocation> r, int add) {   // Caller holds g_res_mu
 }
 static void res_add_at(id<MTLAllocation> allocation, int line) { @autoreleasepool {
     if (!allocation) return;
+    if ([(id)allocation conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)allocation).storageMode == MTLStorageModeMemoryless) return;   // Memoryless textures have no backing allocation and cannot enter MTLResidencySet
     // A placed texture's heap covers storage; fragment sampling through its
     // views also needs the parent texture descriptor. Retire both through the
     // existing ownership and queued-residency paths, not a second heap queue.
@@ -3875,6 +3876,9 @@ static inline void tex_lsize(const tex_t *t, unsigned l, uint32_t *w, uint32_t *
 // Count: across the 4 screens character select / camp / wilderness / combat, 17473 textures needed a different-format view 0 times, so this is a fallback and does not rely on predicting which textures need it
 // The same upgrade adds render-target usage for a whole-level clear (clear_tex) of a texture made without it: Monster Hunter Rise clears a 32x80 packaged one
 static void tex_zero_fill(id<MTLTexture> mt);
+static int fmt_int_or_ds(MTLPixelFormat f);
+static int treg_sampled(const tex_t *t);
+static uint64_t g_stat_memless_up;
 static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextureUsage add, MTLPixelFormat view_pf) {
     id holder = tex_get(t->serial);
     // The serial holds an sRGB / linear view (tex_mtl_) of the asked texture, or the asked texture is that view: the parent is upgraded and the view made again on it, so the pair keeps sharing its bytes
@@ -3882,11 +3886,15 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         && (holder == asked || ((id<MTLTexture>)holder).parentTexture == asked) ? holder : nil;
     id<MTLTexture> base = view ? view.parentTexture : asked;
     if (base.isSparse) { RED_ONCE(149, "a placement sparse texture needs usage %#lx it was not made with (ser=%llu format %#x): kept as it is, not remade whole", (unsigned long)add, (unsigned long long)t->serial, t->d.format); return base; }
+    int was_ml = base.storageMode == MTLStorageModeMemoryless;
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = base.textureType; d.pixelFormat = base.pixelFormat; d.width = base.width; d.height = base.height; d.depth = base.depth;   // Keep the original format, only add the format-view usage
     d.arrayLength = base.arrayLength; d.mipmapLevelCount = base.mipmapLevelCount; d.sampleCount = base.sampleCount;
-    d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
-    d.resourceOptions = base.resourceOptions; d.usage = base.usage | add | (tex_atomic_capable(base) ? MTLTextureUsageShaderAtomic : 0);   // the usage property leaves the atomic usage out
+    d.storageMode = was_ml ? MTLStorageModePrivate : base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
+    d.resourceOptions = was_ml ? ((base.resourceOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModePrivate) : base.resourceOptions;
+    d.usage = base.usage | add | (tex_atomic_capable(base) ? MTLTextureUsageShaderAtomic : 0);   // the usage property leaves the atomic usage out
+    if (base.compressionType == MTLTextureCompressionTypeLossy && (d.usage & (MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite)))
+        d.compressionType = MTLTextureCompressionTypeLossless;   // Metal forbids lossy compression with format views or shader writes
     // A linear texture aliases the guest pool. Adding usage must keep that backing: a new standalone texture copies the old pixels once, but later GPU writes never reach the CPU map.
     id<MTLBuffer> backing = base.buffer;
     int reinterpret = (add & MTLTextureUsageShaderAtomic) && !pf_atomic(base.pixelFormat);   // an RG32Uint texture takes 64-bit atomics as it is (pf_atomic)
@@ -3901,7 +3909,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
     if (!upgraded) { RED_ONCE(45, "texture upgrade failed ser=%llu format %lu → %lu usage %#lx", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, (unsigned long)d.usage); return base; }
     if (!reinterpret) res_add(upgraded);
     id<MTLTexture> upgraded_view = nil;
-    int copy_src = !backing && fam_is_valid(base);
+    int copy_src = !backing && !was_ml && fam_is_valid(base);
     if (!backing && !copy_src) tex_zero_fill(upgraded);
     id<MTL4ComputeCommandEncoder> b = copy_src ? blit() : nil;   // shared backing already contains the pixels; copying it onto itself would overlap; an invalid compressed family member is zeroed instead
     NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
@@ -3931,6 +3939,11 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
     return upgraded_view ? upgraded_view : upgraded;
 }
 static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) { return tex_upgrade(t, base, MTLTextureUsagePixelFormatView, view_pf); }
+static inline id<MTLTexture> tex_materialize(const tex_t *t, id<MTLTexture> mt) {
+    if (!mt || mt.storageMode != MTLStorageModeMemoryless) return mt;
+    g_stat_memless_up++;
+    return tex_upgrade(t, mt, MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, mt.pixelFormat);
+}
 // Packaged texture upload: first take the stamp, then set read-only, then read the pool memory and deswizzle into a staging buffer, and blit into a new private texture.
 // The stamp comes first: a write that faults while the pages are being protected gets a generation above it and leaves its page writable, and its bytes may land after
 // the read; a stamp taken after the protect covered that generation, so the write and every later one to that page went unseen and the texture stayed stale
@@ -6657,8 +6670,45 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
         tu = (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && rh_fits(t, d.usage);   // a render target another one may draw over (tu_pass)
         mt = pair_texture(t, d);   // (neither filled: their storage is shared)
         if (!mt) mt = image_texture(t, d);
-        if (!mt) { mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];
-            if (mt) { res_add(mt); if (!bcp_up_fill(t, mt) && !tex_init_fill(t, mt)) tex_zero_fill(mt); } }   // a side of a compressed-alias pair takes the other side's bytes (bcp_up_fill)
+        if (!mt) {
+            int standalone_rt = (d.usage & MTLTextureUsageRenderTarget)
+                && !(d.usage & (MTLTextureUsagePixelFormatView | MTLTextureUsageShaderWrite))
+                && d.mipmapLevelCount == 1
+                && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)
+                && !(t->d.flags & (NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE));
+            int is_lossy = 0, is_ml = 0;
+            // Optional Apple8+ lossy framebuffer compression (DM_NVN_RT_LOSSY=1/ab): standalone GPU-only 2D color RTs only (never NvImageHeap resolution families or recycled heaps).
+            static int rt_lossy_mode = -1;
+            if (rt_lossy_mode < 0) rt_lossy_mode = sw_mode("DM_NVN_RT_LOSSY", 0);
+            if (rt_lossy_mode && sw_on(rt_lossy_mode) && standalone_rt
+                && d.textureType == MTLTextureType2D && d.sampleCount == 1
+                && [g_dev supportsFamily:MTLGPUFamilyApple8]) {
+                MTLPixelFormat lpf = d.pixelFormat;
+                if (lpf == MTLPixelFormatRGBA8Unorm || lpf == MTLPixelFormatRGBA8Unorm_sRGB
+                    || lpf == MTLPixelFormatBGRA8Unorm || lpf == MTLPixelFormatBGRA8Unorm_sRGB
+                    || lpf == MTLPixelFormatRGB10A2Unorm || lpf == MTLPixelFormatRG11B10Float
+                    || lpf == MTLPixelFormatRGBA16Float) {
+                    d.compressionType = MTLTextureCompressionTypeLossy;
+                    is_lossy = 1;
+                }
+            }
+#if TARGET_OS_IPHONE
+            // Optional TBDR memoryless MSAA color targets (DM_NVN_MSAA_MEMORYLESS=1/ab): 0 bytes DRAM for GPU-only MSAA targets not registered for sampling;
+            // any later load, unfused copy, or bindless/shader sample materializes to MTLStorageModePrivate via tex_materialize().
+            static int msaa_ml_mode = -1;
+            if (msaa_ml_mode < 0) msaa_ml_mode = sw_mode("DM_NVN_MSAA_MEMORYLESS", 0);
+            if (msaa_ml_mode && sw_on(msaa_ml_mode) && standalone_rt
+                && d.textureType == MTLTextureType2DMultisample && d.sampleCount > 1
+                && !fmt_int_or_ds(d.pixelFormat) && !treg_sampled(t)) {
+                d.storageMode = MTLStorageModeMemoryless;
+                d.usage = MTLTextureUsageRenderTarget;
+                is_ml = 1; tu = 0;
+            }
+#endif
+            if (!is_lossy && !is_ml) mt = rh_texture(t, d);
+            if (!mt) mt = [g_dev newTextureWithDescriptor:d];
+            if (mt && !is_ml) { res_add(mt); if (!bcp_up_fill(t, mt) && !tex_init_fill(t, mt)) tex_zero_fill(mt); }
+        }   // a side of a compressed-alias pair takes the other side's bytes (bcp_up_fill)
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return NULL; }
     }
     if (mt.allocatedSize >= (256u << 20)) { static int nb; if (nb++ < 20)   // the textures that take most of the GPU's memory (a GPU out-of-memory error says nothing of which)
@@ -7059,7 +7109,7 @@ void ts_after(void);
 void ms_after(void);
 // ---------- Attachment stores: at pass end, an attachment this pass did not change is not written back ----------
 // On TBDR every attachment is written back to memory in full when the pass ends; Switch (Maxwell immediate-mode rendering) has no such cost.
-typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy, img, rast, fam_san; const char *wkey; int wslot; void *fam_tex; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth
+typedef struct { uint64_t ser, bytes; uint32_t lv, sl; int idx; uint8_t depth, state, ridx, drawn, why, load, wrote, wwhy, img, rast, fam_san, resolve, memoryless; const tex_t *tex; const char *wkey; int wslot; void *fam_tex; } sd_att;   // depth: 0 color 1 depth 2 stencil (the two parts of a combined depth-stencil texture are decided separately)   // state 0 undecided 1 needed 2 redundant; idx: color attachment index, -1 for depth; resolve: MSAA fused into this pass; memoryless: MTLStorageModeMemoryless target
 // Depth and stencil have independent store decisions, even in one combined texture.
 // Eight color targets therefore need ten records (XC2 uses the full set).
 enum { SD_ATT_MAX = 8 + 2 };
@@ -7136,6 +7186,7 @@ void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) {
 
 static uint64_t g_sd_dead_bytes, g_sd_n_dead, g_sd_n_all;
 static void sd_finish(void);
+static void msaa_fuse_try(MTL4RenderPassDescriptor *pd);
 static int pf_is_float(MTLPixelFormat f) {   // Float color formats that can store NaN (sentinel choice for the load-elision probe; RGB9E5 cannot store NaN and does not count)
     switch (f) { case MTLPixelFormatR16Float: case MTLPixelFormatRG16Float: case MTLPixelFormatRGBA16Float: case MTLPixelFormatR32Float:
         case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA32Float: case MTLPixelFormatRG11B10Float: return 1; default: return 0; }
@@ -7553,6 +7604,11 @@ static void *rp_begin_ex_(int clear_only) {
         if (rt_dup_slot(&R.rt, i)) continue;   // a slot attached twice is not attached (see rt_dup_slot)
         attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
         if (!pd.colorAttachments[i].texture) continue;
+        if (!R.clear_c[i] && pd.colorAttachments[i].texture.storageMode == MTLStorageModeMemoryless) {
+            (void)tex_materialize(R.rt.color[i], pd.colorAttachments[i].texture);
+            attach(pd.colorAttachments[i], R.rt.color[i], &R.rt.cview[i], R.rt.has_cview[i]);
+            if (!pd.colorAttachments[i].texture) continue;
+        }
         any = 1;
         pd.colorAttachments[i].loadAction = R.clear_c[i] ? MTLLoadActionClear : MTLLoadActionLoad;
         pd.colorAttachments[i].clearColor = R.cc[i];
@@ -7687,7 +7743,8 @@ static void *rp_begin_ex_(int clear_only) {
     for (int i = 0; i < R.rt.n; i++) {
         MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i];
         if (!c.texture) continue;
-        uint64_t b = att_bytes(c.texture, c.level); natt++; g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; }
+        uint64_t b = att_bytes(c.texture, c.level); natt++;
+        if (c.texture.storageMode != MTLStorageModeMemoryless) { g_bw_store += b; if (c.loadAction == MTLLoadActionLoad) { g_bw_load += b; nload++; } }
         if (R.rt.has_cview[i] && R.rt.cview[i].set_format) PD("V %llu c%d view format %#x (base texture NVN format %#x)", g_stat_pass + 1, i, R.rt.cview[i].format, R.rt.color[i]->d.format);
         PD("P %llu c%d ser=%llu fmt=%lu %lux%lu ms%lu lv%lu sl%lu %s mtl=%p", g_stat_pass + 1, i, R.rt.color[i]->serial, (unsigned long)c.texture.pixelFormat,
            (unsigned long)c.texture.width, (unsigned long)c.texture.height, (unsigned long)c.texture.sampleCount, (unsigned long)c.level, (unsigned long)c.slice,
@@ -7710,14 +7767,14 @@ static void *rp_begin_ex_(int clear_only) {
     {
         // A standalone clear has already stored before this pass; only a clear load action here writes this pass's tiles.
         for (int i = 0; i < R.rt.n && i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[i]; if (!c.texture || bcrt_is(c.texture)) continue;
-            g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad || fam_san_c[i]; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_sd[g_nsd].rast = c.loadAction == MTLLoadActionClear && !fam_san_c[i]; g_sd[g_nsd].fam_san = fam_san_c[i]; g_sd[g_nsd].fam_tex = (__bridge void *)c.texture; g_nsd++;
+            g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.color[i]->serial; g_sd[g_nsd].tex = R.rt.color[i]; g_sd[g_nsd].bytes = att_bytes(c.texture, c.level); g_sd[g_nsd].lv = (uint32_t)c.level; g_sd[g_nsd].sl = (uint32_t)(c.texture.textureType == MTLTextureType3D ? c.depthPlane : c.slice); g_sd[g_nsd].idx = i; g_sd[g_nsd].load = c.loadAction == MTLLoadActionLoad || fam_san_c[i]; g_sd[g_nsd].wrote = R.clear_c[i] != 0; g_sd[g_nsd].rast = c.loadAction == MTLLoadActionClear && !fam_san_c[i]; g_sd[g_nsd].fam_san = fam_san_c[i]; g_sd[g_nsd].memoryless = c.texture.storageMode == MTLStorageModeMemoryless; g_sd[g_nsd].fam_tex = (__bridge void *)c.texture; g_nsd++;
             c.storeAction = MTLStoreActionUnknown; }
         id<MTLTexture> dt = pd.depthAttachment.texture, stt = pd.stencilAttachment.texture;
         uint64_t db = att_bytes(dt, pd.depthAttachment.level), sb = 0;
         if (stt) { int comb = stt.pixelFormat == MTLPixelFormatDepth32Float_Stencil8; sb = att_bytes(stt, pd.stencilAttachment.level) / (comb ? 5 : 1); if (stt == dt) db -= sb; }   // Combined format 5 bytes = depth 4 + stencil 1 (when only stencil is attached, only 1 is counted)
-        if (dt) { g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.depth->serial; g_sd[g_nsd].bytes = db; g_sd[g_nsd].lv = (uint32_t)pd.depthAttachment.level; g_sd[g_nsd].sl = (uint32_t)pd.depthAttachment.slice; g_sd[g_nsd].idx = -1; g_sd[g_nsd].depth = 1; g_sd[g_nsd].load = pd.depthAttachment.loadAction == MTLLoadActionLoad || fam_san_d; g_sd[g_nsd].wrote = R.clear_d != 0; g_sd[g_nsd].fam_san = fam_san_d; g_sd[g_nsd].fam_tex = (__bridge void *)dt; g_nsd++;
+        if (dt) { g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.depth->serial; g_sd[g_nsd].tex = R.rt.depth; g_sd[g_nsd].bytes = db; g_sd[g_nsd].lv = (uint32_t)pd.depthAttachment.level; g_sd[g_nsd].sl = (uint32_t)pd.depthAttachment.slice; g_sd[g_nsd].idx = -1; g_sd[g_nsd].depth = 1; g_sd[g_nsd].load = pd.depthAttachment.loadAction == MTLLoadActionLoad || fam_san_d; g_sd[g_nsd].wrote = R.clear_d != 0; g_sd[g_nsd].fam_san = fam_san_d; g_sd[g_nsd].fam_tex = (__bridge void *)dt; g_nsd++;
                   pd.depthAttachment.storeAction = MTLStoreActionUnknown; }
-        if (stt) { g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.depth->serial; g_sd[g_nsd].bytes = sb; g_sd[g_nsd].lv = (uint32_t)pd.stencilAttachment.level; g_sd[g_nsd].sl = (uint32_t)pd.stencilAttachment.slice; g_sd[g_nsd].idx = -1; g_sd[g_nsd].depth = 2; g_sd[g_nsd].load = pd.stencilAttachment.loadAction == MTLLoadActionLoad || fam_san_s; g_sd[g_nsd].wrote = R.clear_s != 0; g_sd[g_nsd].fam_san = fam_san_s; g_sd[g_nsd].fam_tex = (__bridge void *)stt; g_nsd++;
+        if (stt) { g_sd[g_nsd] = (sd_att){0}; g_sd[g_nsd].ser = R.rt.depth->serial; g_sd[g_nsd].tex = R.rt.depth; g_sd[g_nsd].bytes = sb; g_sd[g_nsd].lv = (uint32_t)pd.stencilAttachment.level; g_sd[g_nsd].sl = (uint32_t)pd.stencilAttachment.slice; g_sd[g_nsd].idx = -1; g_sd[g_nsd].depth = 2; g_sd[g_nsd].load = pd.stencilAttachment.loadAction == MTLLoadActionLoad || fam_san_s; g_sd[g_nsd].wrote = R.clear_s != 0; g_sd[g_nsd].fam_san = fam_san_s; g_sd[g_nsd].fam_tex = (__bridge void *)stt; g_nsd++;
                    pd.stencilAttachment.storeAction = MTLStoreActionUnknown; }
     }
     uint32_t ds_clear = (R.clear_d && pd.depthAttachment.texture ? FB_DS_DEPTH : 0) |
@@ -7763,6 +7820,7 @@ static void *rp_begin_ex_(int clear_only) {
     if (g_nrtm) rt_mirror_layers(pd);
     g_fsm_na = 0;
     if (g_fsm_np) { if (g_fsp_pass) fsm_attach(pd); g_fsm_np = 0; }   // later face-split draws of the same level size moved into this pass (fsm_plan)
+    if (!clear_only && !g_fsp_pass && !g_sm_pass && !g_rp_layered && !g_rp_aw) msaa_fuse_try(pd);
     pg_render(pd, (NSUInteger)R.rt.n);
     { void td_note(id pd, NSUInteger nc); td_note(pd, (NSUInteger)R.rt.n);
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n);
@@ -8718,6 +8776,52 @@ static void treg_drop_stand(treg_t *r) {
     if (r->stand) { defer_obj_unref((__bridge id)r->stand); CFRelease(r->stand); r->stand = NULL; r->stand_rid = 0; g_stand_live--; }
     r->stand_no = 0;
 }
+// Hardened byte-range pool registration index (under g_rmu): tracks [off, off + size) spans per pool so treg_sampled() catches both exact-serial and offset-shifted/sub-slice pool aliases.
+// Pools exceeding TREG_POOL_MAX distinct spans (e.g. large static asset pools) increment overflow and conservatively report sampled=1 in O(1).
+typedef struct { uint64_t lo, hi; uint32_t refs; } treg_span_t;
+enum { TREG_POOL_MAX = 128 };
+typedef struct { treg_span_t spans[TREG_POOL_MAX]; uint32_t n, overflow; } treg_pool_t;
+static nvn_hmap g_treg_pools = {.klen = sizeof(uintptr_t)};
+static void treg_pool_adj(const tex_t *t, int delta) {   // Caller holds g_rmu
+    if (!t || !t->pool) return;
+    uintptr_t pk = (uintptr_t)t->pool;
+    treg_pool_t *p = nvn_hm_get(&g_treg_pools, &pk);
+    uint64_t sz = t->L.size;
+    if (delta > 0) {
+        if (!p) { p = calloc(1, sizeof *p); if (!p) MDIE("treg pool range index"); nvn_hm_put(&g_treg_pools, &pk, p); }
+        if (!sz) { p->overflow++; return; }
+        uint64_t lo = t->off, hi = lo + sz;
+        for (uint32_t i = 0; i < p->n; i++) if (p->spans[i].lo == lo && p->spans[i].hi == hi) { p->spans[i].refs++; return; }
+        if (p->n < TREG_POOL_MAX) { p->spans[p->n++] = (treg_span_t){lo, hi, 1}; return; }
+        p->overflow++;
+    } else if (p) {
+        if (!sz) { if (p->overflow) p->overflow--; return; }
+        uint64_t lo = t->off, hi = lo + sz;
+        for (uint32_t i = 0; i < p->n; i++) if (p->spans[i].lo == lo && p->spans[i].hi == hi) {
+            if (!--p->spans[i].refs) p->spans[i] = p->spans[--p->n];
+            return;
+        }
+        if (p->overflow) p->overflow--;
+    }
+}
+static int treg_sampled(const tex_t *t) {
+    if (!t || !t->serial) return 1;
+    os_unfair_lock_lock(&g_rmu);
+    int hit = nvn_hm_get(&g_treg_serial, &t->serial) != NULL;
+    if (!hit && t->pool) {
+        uintptr_t pk = (uintptr_t)t->pool;
+        treg_pool_t *p = nvn_hm_get(&g_treg_pools, &pk);
+        if (p) {
+            if (p->overflow || !t->L.size) hit = 1;
+            else {
+                uint64_t lo = t->off, hi = lo + t->L.size;
+                for (uint32_t i = 0; i < p->n; i++) if (lo < p->spans[i].hi && p->spans[i].lo < hi) { hit = 1; break; }
+            }
+        }
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    return hit;
+}
 static void treg_unlink(int id_) {
     treg_t *r = &g_treg[id_];
     if (!r->ok || !r->t.serial) return;
@@ -8973,7 +9077,7 @@ void mtl_tb2_stats(uint64_t *binds, uint64_t *made, uint64_t *fail, uint64_t *co
 // registration makes them again. It released only the primary view, and the image view when there was one: the type-compatible view (tex_fit) and the pool tables' views (pool_fit)
 // kept their texture, a pool-backed one the whole pool buffer, until the ID was registered with other data (PR #923; registering the same data keeps the views)
 static void treg_gone(treg_t *r) {
-    if (!r->gone) { reg_bump((int)(r - g_treg), 0); bcp_idx((int)(r - g_treg), &r->t, 0); }   // its pool table entries become the dummy: the tables take the ID again (pool_gpu); no pair side while its storage is gone
+    if (!r->gone) { reg_bump((int)(r - g_treg), 0); bcp_idx((int)(r - g_treg), &r->t, 0); treg_pool_adj(&r->t, -1); }   // its pool table entries become the dummy: the tables take the ID again (pool_gpu); no pair side while its storage is gone
     r->gone = 1;
     treg_drop_views(r);
     treg_drop_stand(r);
@@ -8982,6 +9086,9 @@ static void treg_drop_pool_views(const void *pool) {
     os_unfair_lock_lock(&g_rmu);
     vc_drop_pool(pool);
     for (int i = 0; i < g_ntreg; i++) if (g_treg[i].ok && (const void *)g_treg[i].t.pool == pool) treg_gone(&g_treg[i]);
+    uintptr_t pk = (uintptr_t)pool;
+    treg_pool_t *p = nvn_hm_get(&g_treg_pools, &pk);
+    if (p && !p->n && !p->overflow) { nvn_hm_del(&g_treg_pools, &pk); free(p); }
     os_unfair_lock_unlock(&g_rmu);
 }
 // Which texture IDs shaders read through a pool (dmsh_reflect.py pool_arrays): a bitmap the shaders set, one bit an ID, which the host folds into g_seen_done at each submission. A handle read from game
@@ -9037,7 +9144,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     treg_t *rr = &g_treg[id_];
     int same = t && rr->ok && rr->has_v == (v != NULL) && !memcmp(&rr->t, t, sizeof *t) && (!v || !memcmp(&rr->v, v, sizeof *v));
     int was_gone = rr->gone;
-    if (was_gone) { rr->gone = 0; reg_bump(id_, 0); if (rr->ok) bcp_idx(id_, &rr->t, 1); }   // registered again (pool storage made anew), even with the same data; a pair side again
+    if (was_gone) { rr->gone = 0; reg_bump(id_, 0); if (rr->ok) { bcp_idx(id_, &rr->t, 1); treg_pool_adj(&rr->t, 1); } }   // registered again (pool storage made anew), even with the same data; a pair side again
     if (!same) {
         // The read mark (pool_seen) is the ID's: shaders read an ID, whatever texture the game puts into it, so the mark stays while the ID holds a texture and the next walk makes the new
         // one under the read budget (POOL_REQ_BYTES). Cleared on every change, it left a streamed replacement to the walk's room (pool_room), which is 0 once pool_budget() is spent:
@@ -9047,9 +9154,9 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
         reg_bump(id_, 0); if (!t) pool_seen_clear(id_); else if (rr->ok && tex_reg_target(rr) != tex_reg_target_of(t, v)) pool_seen_retype(id_);
         treg_unlink(id_); treg_drop_views(rr); treg_drop_stand(rr);
         rr->tt1 = 0; rr->reg_frame = atomic_load(&g_cur_frame);
-        if (rr->ok) bcp_idx(id_, &rr->t, 0);
+        if (rr->ok) { bcp_idx(id_, &rr->t, 0); treg_pool_adj(&rr->t, -1); }
         rr->ok = t != NULL; if (t) rr->t = *t; rr->has_v = v != NULL; if (v) rr->v = *v;
-        if (t) bcp_idx(id_, t, 1);   // a side of a compressed-alias pair, found by its storage
+        if (t) { bcp_idx(id_, t, 1); treg_pool_adj(t, 1); }   // a side of a compressed-alias pair, found by its storage
         rr->retired = 0; rr->transient_sub = 0; rr->evicted = 0; rr->used = 0;
         if (t && t->serial) {
             rr->retired = !own_tex_live(t->serial);
@@ -9184,6 +9291,7 @@ static void *tex_by_id_ref(int tid) {
         defer_obj_unref(v); CFRelease(rp->view); rp->view = NULL; rp->view_rid = 0; rp->view_pf = 0; rp->view_tt = 0; v = nil;
     } else base = treg_tex(rp);
     treg_t r = *rp;
+    if (base && base.storageMode == MTLStorageModeMemoryless) { base = tex_materialize(&r.t, base); sg = treg_ep(); }   // Never expose a Memoryless gpuResourceID to shaders or bindless pools
     if (!base) { if (rp->gone) { static uint64_t n; if (n++ < 4) MLOG("texture ID %d read after its memory pool was finalized ser=%llu %ux%u format %#x: treated as an empty slot (%llu so far)", tid, (unsigned long long)rp->t.serial, rp->t.d.width, rp->t.d.height, rp->t.d.format, (unsigned long long)n); } return NULL; }
     v = base;
     // Channel swizzle: the view's if set, otherwise the one from texture building; identity builds no view (SMBW's font cache is (1 1 1 R): without the swizzle glyphs become white blocks).
@@ -16263,6 +16371,164 @@ static void vis_need_scan(const uint8_t *next) {   // at a samples-passed reset 
 }
 static void draw(const p_draw *dw, const p_draw_idx *di);
 static void sd_need(sd_att *t, int why) { if (!t->state) { t->state = 1; t->why = (uint8_t)why; } }   // why: 1 a draw reads it as a texture 2 as an attachment, drawn before cleared 3 copy 4 texture clear 5 scanned to the end undecided 6 no start point / index unavailable
+// DM_NVN_MSAA_FUSE=0|1|ab (on by default): when a single-layer full-area MSAA render pass is immediately followed by OP_COPY_T2T(DM_COPY_RESOLVE) of its color attachment(s)
+// before any other work, attach resolveTexture directly on this render pass so Apple9 TBDR resolves from on-chip tile memory in 1 pass.
+// Safety: each fused resolve records g_pass.serial; if a pass split occurs before OP_COPY_T2T, the serial mismatch drops the fusion and copy_t2t runs normally.
+static int msaa_fuse_on(void) {
+    static int m = -1;
+    if (m < 0) { m = sw_mode("DM_NVN_MSAA_FUSE", 1); if (m != 1) MLOG("DM_NVN_MSAA_FUSE=%s: MSAA resolves stay in a separate pass%s", getenv("DM_NVN_MSAA_FUSE"), m ? ", in the A/B phases it is off in" : ""); }
+    return m && sw_on(m);
+}
+typedef struct { const uint8_t *op; uint64_t pass_serial; } fused_res_t;
+static fused_res_t g_fused_res[8]; static int g_nfused_res, g_fused_end; static uint64_t g_fused_res_sub, g_stat_msaa_fuse;
+static int fused_res_take(const uint8_t *p, uint64_t pass_serial) {
+    if (g_fused_res_sub != g_sub_serial) { g_nfused_res = 0; return 0; }
+    for (int i = 0; i < g_nfused_res; i++) if (g_fused_res[i].op == p) {
+        int ok = g_fused_res[i].pass_serial == pass_serial;
+        g_fused_res[i] = g_fused_res[--g_nfused_res];
+        return ok;
+    }
+    return 0;
+}
+static inline int tex_storage_overlaps(const tex_t *a, const tex_t *b) {
+    if (!a || !b) return 0;
+    if (a->serial && a->serial == b->serial) return 1;
+    if (!a->pool || a->pool != b->pool) return 0;
+    if (!a->L.size || !b->L.size) return 1;   // unknown extent in same pool: conservative overlap
+    return a->off < b->off + b->L.size && b->off < a->off + a->L.size;
+}
+static void msaa_fuse_try(MTL4RenderPassDescriptor *pd) {
+    if (!msaa_fuse_on() || !g_exec_next || g_ret_n > 8) return;
+    int has_msaa = 0;
+    for (int k = 0; k < g_nsd; k++) if (g_sd[k].depth == 0 && pd.colorAttachments[g_sd[k].idx].texture.sampleCount > 1) { has_msaa = 1; break; }
+    if (!has_msaa) return;   // zero scan cost on non-MSAA passes
+    if (g_fused_res_sub != g_sub_serial) { g_nfused_res = 0; g_fused_res_sub = g_sub_serial; }
+    op_cursor cur = {.p = g_exec_next, .ret_n = g_ret_n, .pass_multi = 1};
+    memcpy(cur.ret, g_ret, sizeof(*g_ret) * (size_t)g_ret_n);
+    const uint8_t *q; op_hdr h; const void *a;
+    int unbind_seen = 0;
+    for (int guard = 0; guard < 512 && op_next(&cur, &q, &h, &a); guard++) {
+        switch (h.op) {
+            case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW:
+                if (unbind_seen) return;
+                continue;
+            case OP_SET_RT: {
+                const p_set_rt *rt = a;
+                for (int i = 0; i < rt->n && i < 8; i++)
+                    for (int k = 0; k < g_nsd; k++) if (g_sd[k].depth == 0 && rt->color[i] && tex_storage_overlaps(rt->color[i], g_sd[k].tex)) return;
+                unbind_seen = 1;
+                continue;
+            }
+            case OP_COPY_T2T: {
+                const p_copy_t2t *cp = a;
+                if (!(cp->flags & DM_COPY_RESOLVE) || !cp->src || !cp->dst || nvn_fmt_bc(cp->dst->d.format)) return;
+                if (cp->dst->d.flags & (NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return;
+                if (!cp->dst->pool || !(cp->dst->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return;   // keep CPU-visible mirror path in copy_t2t
+                unsigned sl = cp->has_sv && cp->sv.set_levels ? cp->sv.base_level : 0;
+                unsigned sz0 = cp->has_sv && cp->sv.set_layers ? cp->sv.min_layer : 0;
+                unsigned dl = cp->has_dv && cp->dv.set_levels ? cp->dv.base_level : 0;
+                unsigned dz0 = cp->has_dv && cp->dv.set_layers ? cp->dv.min_layer : 0;
+                int matched = 0;
+                for (int k = 0; k < g_nsd; k++) {
+                    sd_att *t = &g_sd[k];
+                    if (t->depth != 0 || t->resolve || t->ser != cp->src->serial || t->lv != sl || t->sl != sz0) continue;
+                    MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[t->idx];
+                    if (!c.texture || c.texture.sampleCount <= 1 || c.texture.textureType == MTLTextureType3D) continue;
+                    id<MTLTexture> dt = tex_mtl_all(cp->dst);
+                    if (!dt || dt.sampleCount != 1 || dt.textureType == MTLTextureType3D || dt.storageMode == MTLStorageModeMemoryless || bcrt_is(dt)) continue;
+                    if (dt.pixelFormat != c.texture.pixelFormat || dl >= dt.mipmapLevelCount) continue;
+                    NSUInteger sw = mip_extent(c.texture.width, sl), sh = mip_extent(c.texture.height, sl);
+                    NSUInteger dw = mip_extent(dt.width, dl), dh = mip_extent(dt.height, dl);
+                    if (sw != dw || sh != dh) continue;
+                    NSUInteger d_slices = dt.arrayLength * (dt.textureType == MTLTextureTypeCube || dt.textureType == MTLTextureTypeCubeArray ? 6u : 1u);
+                    if (dz0 >= d_slices) continue;
+                    if (g_nfused_res >= 8) return;
+                    c.resolveTexture = dt; c.resolveLevel = dl; c.resolveSlice = dz0;
+                    t->resolve = 1;
+                    g_fused_res[g_nfused_res++] = (fused_res_t){q, g_pass.serial};
+                    matched = 1;
+                    break;
+                }
+                if (!matched) return;
+                continue;
+            }
+            case OP_BEGIN: case OP_SCISSOR: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM:
+            case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_SSBO:
+            case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL: case OP_POLY_OFFSET:
+            case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_PATCH_SIZE: case OP_LINE_WIDTH: case OP_VP_SWIZZLE:
+            case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_PUSH_CONST: case OP_COPY_STRIDE: case OP_PRIM_RESTART:
+            case OP_RAST_DISCARD: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_BARRIER:
+                continue;
+            default:
+                return;
+        }
+    }
+}
+// DM_NVN_TRANSIENT_DC=0|1|ab (on by default): at pass end, scan forward up to 512 ops within the current submission for an unconditional full-target OP_CLEAR_DS
+// overwriting the depth or stencil plane before any draw/dispatch/copy/conditional-render can read it. Uses hardened byte-range treg_sampled() and pool-overlap checks.
+static int transient_dc_on(void) {
+    static int m = -1;
+    if (m < 0) { m = sw_mode("DM_NVN_TRANSIENT_DC", 1); if (m != 1) MLOG("DM_NVN_TRANSIENT_DC=%s: transient depth/stencil store elision disabled%s", getenv("DM_NVN_TRANSIENT_DC"), m ? ", in the A/B phases it is off in" : ""); }
+    return m && sw_on(m);
+}
+static uint64_t g_stat_tdc, g_stat_tdc_bytes;
+static int sd_transient_dead(const sd_att *t) {
+    if (!g_exec_cur || g_ret_n > 8 || !t->tex || (t->tex->d.flags & NVN_TEXTURE_FLAGS_SPARSE) || g_pass.layered || t->fam_san) return 0;
+    if (!t->tex->pool || !(t->tex->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) return 0;
+    int sampled = treg_sampled(t->tex);
+    op_cursor cur = {.p = g_exec_cur, .ret_n = g_ret_n, .pass_multi = 1};
+    memcpy(cur.ret, g_ret, sizeof(*g_ret) * (size_t)g_ret_n);
+    const tex_t *cur_d = R.rt.depth; view_t cur_dv = R.rt.dview; int cur_has_dv = R.rt.has_dview;
+    p_scissor cur_sc = R.sc; int cur_has_sc = R.has_sc;
+    const uint8_t *q; op_hdr h; const void *a;
+    for (int guard = 0; guard < 512 && op_next(&cur, &q, &h, &a); guard++) {
+        switch (h.op) {
+            case OP_SET_RT: {
+                const p_set_rt *rt = a;
+                for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i] && tex_storage_overlaps(rt->color[i], t->tex)) return 0;
+                if (rt->depth && rt->depth->serial != t->ser && tex_storage_overlaps(rt->depth, t->tex)) return 0;
+                cur_d = rt->depth; cur_dv = rt->dview; cur_has_dv = rt->has_dview;
+                continue;
+            }
+            case OP_SCISSOR:
+                cur_sc = *(const p_scissor *)a; cur_has_sc = 1;
+                continue;
+            case OP_CLEAR_DS: {
+                const p_clear_ds *c = a;
+                if (!cur_d || cur_d->serial != t->ser) continue;
+                unsigned dlv = cur_has_dv && cur_dv.set_levels ? cur_dv.base_level : 0;
+                unsigned dsl = cur_has_dv && cur_dv.set_layers ? cur_dv.min_layer : 0;
+                if (dlv != t->lv || dsl != t->sl) continue;
+                uint32_t tw = 0, th = 0; tex_lsize(cur_d, (unsigned)MIN(dlv, 32u), &tw, &th, NULL);
+                int full = !cur_has_sc || (cur_sc.x <= 0 && cur_sc.y <= 0 && (int64_t)cur_sc.x + cur_sc.w >= (int64_t)tw && (int64_t)cur_sc.y + cur_sc.h >= (int64_t)th);
+                if (!full) return 0;
+                if (t->depth == 1 && c->depth_mask) return 1;
+                if (t->depth == 2) {
+                    if (((unsigned)c->stencil_mask & 0xffu) == 0xffu) return 1;
+                    if (c->stencil_mask) return 0;   // partial stencil mask preserves existing bits
+                }
+                continue;
+            }
+            case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW:
+                if (sampled || (cur_d && tex_storage_overlaps(cur_d, t->tex))) return 0;
+                continue;
+            case OP_DISPATCH: case OP_RT_DISPATCH:
+                if (sampled) return 0;
+                continue;
+            case OP_BEGIN: case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM:
+            case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_SSBO:
+            case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL: case OP_POLY_OFFSET:
+            case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_PATCH_SIZE: case OP_LINE_WIDTH: case OP_VP_SWIZZLE:
+            case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_PUSH_CONST: case OP_COPY_STRIDE: case OP_TF_BIND: case OP_RAST_DISCARD:
+            case OP_PRIM_RESTART: case OP_BARRIER: case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: case OP_RESET_COUNTER:
+            case OP_REPORT_COUNTER: case OP_UPDATE_UB: case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_CLEAR_COLOR:
+                continue;
+            default:
+                return 0;   // copies, conditional renders, DLSS, clears, etc. conservatively abort
+        }
+    }
+    return 0;
+}
 static void sd_finish(void) {
     if (!g_nsd) return;
     // Unchanged, loaded attachments already have their content in memory. Their proof depends only on writes in this pass, independently of future bindless readers or the optional lookahead.
@@ -16276,13 +16542,25 @@ static void sd_finish(void) {
         // A loaded color tile with no raster output or clear holds only the old memory contents. Storing it can overwrite image writes to the same texture
         // (Dark Souls' image-only AO pass). This is required for correctness even when store optimizations are disabled; mixed tile/image writers retain their store.
         int img_dead = t->depth == 0 && t->load && t->img && !t->rast;
-        int dead = (udc_dead || img_dead) && !(ds_store && t->depth && t->fam_tex == ds_tex);
-        MTLStoreAction sa = dead ? MTLStoreActionDontCare : MTLStoreActionStore;
+        int tdc_dead = !udc_dead && !img_dead && !t->resolve && (t->depth == 1 || t->depth == 2) && transient_dc_on() && sd_transient_dead(t);
+        int dead = (udc_dead || img_dead || tdc_dead) && !(ds_store && t->depth && t->fam_tex == ds_tex);
+        MTLStoreAction sa = t->memoryless ? (t->resolve ? MTLStoreActionMultisampleResolve : MTLStoreActionDontCare)
+                                          : t->resolve ? ((g_fused_end && (!treg_sampled(t->tex) || dead)) ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve)
+                                          : (dead ? MTLStoreActionDontCare : MTLStoreActionStore);
         if (t->depth == 1) [g_enc setDepthStoreAction:sa]; else if (t->depth == 2) [g_enc setStencilStoreAction:sa]; else [g_enc setColorStoreAction:sa atIndex:(NSUInteger)t->idx];
-        if (!dead && t->fam_tex) fam_mark_valid((__bridge id<MTLTexture>)t->fam_tex);
-        g_sd_n_all++; if (dead) { g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes; if (udc_dead) g_udc_saved_bytes += t->bytes; }
+        if (!dead && !t->memoryless && t->fam_tex) fam_mark_valid((__bridge id<MTLTexture>)t->fam_tex);
+        g_sd_n_all++;
+        if (dead && !t->resolve && !t->memoryless) {
+            g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes;
+            if (udc_dead) g_udc_saved_bytes += t->bytes;
+            if (tdc_dead) { g_stat_tdc++; g_stat_tdc_bytes += t->bytes; PD("Z %llu transient depth/stencil elided (count=%llu saved=%.1fMB)", g_stat_pass, (unsigned long long)g_stat_tdc, (double)g_stat_tdc_bytes / 1048576.0); }
+        } else if (t->resolve && sa == MTLStoreActionMultisampleResolve && !t->memoryless) {
+            g_sd_n_dead++; g_sd_dead_bytes += t->bytes; g_bw_store -= t->bytes;
+        }
         if (!t->state) t->why = 5;
-        PD("Z %llu %s ser=%llu lv%u sl%u %s why=%d by=%s slot=%d", g_stat_pass, t->depth == 1 ? "d" : t->depth == 2 ? "s" : "c", (unsigned long long)t->ser, t->lv, t->sl, dead ? "dontcare" : "store", dead ? 0 : t->why, t->why == 1 && t->wkey ? t->wkey : "-", t->wslot);
+        PD("Z %llu %s ser=%llu lv%u sl%u %s why=%d by=%s slot=%d", g_stat_pass, t->depth == 1 ? "d" : t->depth == 2 ? "s" : "c", (unsigned long long)t->ser, t->lv, t->sl,
+           sa == MTLStoreActionDontCare ? "dontcare" : sa == MTLStoreActionMultisampleResolve ? "resolve" : sa == MTLStoreActionStoreAndMultisampleResolve ? "store+resolve" : "store",
+           dead ? 0 : t->why, t->why == 1 && t->wkey ? t->wkey : "-", t->wslot);
         if (udc_on()) PD("U %llu %s ser=%llu lv%u sl%u runtime=%s reason=%s state=%d load=%d", g_stat_pass, t->depth == 1 ? "d" : t->depth == 2 ? "s" : "c", (unsigned long long)t->ser, t->lv, t->sl, t->wrote ? "written" : "unwritten", t->wwhy == 1 ? "image_write" : t->wwhy == 2 ? "color_write_mask" : t->wwhy == 4 ? "depth_write" : t->wwhy == 5 ? "stencil_write" : "none", t->state, t->load);
     }
     g_nsd = 0;
@@ -19412,7 +19690,7 @@ static int rb_copy_shift(const tex_t *t, id<MTLTexture> mt) { return mt.buffer ?
 static void copy_t2b(const p_copy_b2t *c, uint32_t size) {
     rp_flush();   // Materialize pending clears before reading, matching copy_t2t.
     g_wr_epoch++; g_mdx_epoch++;
-    id<MTLTexture> t = tex_mtl_all(c->tex);
+    id<MTLTexture> t = tex_materialize(c->tex, tex_mtl_all(c->tex));
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
@@ -19540,7 +19818,7 @@ static size_t mtl_pf_block_bytes(MTLPixelFormat pf) {   // bytes per texel, or p
     return mtl_pf_bytes(pf);
 }
 static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
-    id<MTLTexture> t = tex_mtl_all(c->tex); sparse_gpu_wrote(c->tex); tu_wrote(t);
+    id<MTLTexture> t = tex_materialize(c->tex, tex_mtl_all(c->tex)); sparse_gpu_wrote(c->tex); tu_wrote(t);
     if (!t) { PD("C ser=%llu (no host texture)", c->tex->serial); return; }
     tex_t pair; int paired = bcp_before(c->tex, t, &pair);   // a side of a compressed-alias pair: filled first, the copied region goes into its other side after
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
@@ -19987,14 +20265,14 @@ static int bc_alias_copy(const p_copy_t2t *c, id<MTLTexture> s, unsigned sl, uns
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static id<MTLTexture> copy_t2t_enc(const p_copy_t2t *c) {
     rp_flush();   // Land the pending pure-clear render pass first; the blit() below would end the render pass anyway
-    id<MTLTexture> s = tex_mtl_all(c->src);
+    id<MTLTexture> s = tex_materialize(c->src, tex_mtl_all(c->src));
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
     if (!s || !c->dst) return nil;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
     if (!tex_level_ok(s, sl, "texture copy source")) return nil;
     if (bc_alias_copy(c, s, sl, sz0, dl, dz0)) return nil;   // the destination aliases a compressed texture: the bytes go there, and the alias's own texture is not made (see bc_alias_copy)
-    id<MTLTexture> d = tex_mtl_all(c->dst); sparse_gpu_wrote(c->dst); tu_wrote(d);
+    id<MTLTexture> d = tex_materialize(c->dst, tex_mtl_all(c->dst)); sparse_gpu_wrote(c->dst); tu_wrote(d);
     if (!d || !tex_level_ok(d, dl, "texture copy destination")) return nil;
     { tex_t pair; bcp_before(c->dst, d, &pair); }   // a side of a compressed-alias pair: filled first, the copied region goes into its other side after (copy_t2t)
     int fam_full_d = (c->flags & DM_COPY_RESOLVE)
@@ -20367,7 +20645,7 @@ static unsigned mtl_pf_chmask(MTLPixelFormat pf) {
 // View with changed format: clear on that view. Partial colour regions / channel masks use a triangle and preserve everything else.
 static void clear_tex_tri(id<MTLTexture> t, unsigned lv, unsigned l0, const p_clear_tex *c);
 static void clear_tex(const p_clear_tex *c) {
-    id<MTLTexture> t = tex_mtl_all(c->tex); sparse_gpu_wrote(c->tex); tu_wrote(t);
+    id<MTLTexture> t = tex_materialize(c->tex, tex_mtl_all(c->tex)); sparse_gpu_wrote(c->tex); tu_wrote(t);
     tex_t pair; int paired = t && bcp_before(c->tex, t, &pair);   // a side of a compressed-alias pair: filled first, the cleared region goes into its other side after
     PD("X ser=%llu view format %#x region %d,%d,%d %dx%dx%d mask %#x %s %g,%g,%g,%g", c->tex ? c->tex->serial : 0ull, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
        c->is_uint ? "ui" : "f", c->is_uint ? (double)c->c.u[0] : c->c.f[0], c->is_uint ? (double)c->c.u[1] : c->c.f[1], c->is_uint ? (double)c->c.u[2] : c->c.f[2], c->is_uint ? (double)c->c.u[3] : c->c.f[3]);
@@ -20860,7 +21138,16 @@ void mtl_exec(const uint8_t *p) {
             case OP_RAST_DISCARD: PD("Y rasterizer discard %d", ((const p_rast_discard *)a)->on); state_op(h.op, a); break;
             case OP_COPY_B2T: copy_b2t(a, h.size); break;
             case OP_COPY_T2B: copy_t2b(a, h.size); break;
-            case OP_COPY_T2T: copy_t2t(a); break;
+            case OP_COPY_T2T:
+                if (g_nfused_res && fused_res_take(p, g_pass.serial)) {
+                    const p_copy_t2t *cp = a;
+                    g_fused_end = 1; rp_end(); g_fused_end = 0;
+                    id<MTLTexture> dt = cp->dst ? tex_mtl_all(cp->dst) : nil;
+                    if (dt) { tu_wrote(dt); fam_mark_valid(dt); }
+                    g_stat_msaa_fuse++;
+                    PD("T fused MSAA resolve dst=%llu (total=%llu)", cp->dst ? cp->dst->serial : 0ull, (unsigned long long)g_stat_msaa_fuse);
+                } else copy_t2t(a);
+                break;
             case OP_DRAW_TEX: draw_tex(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DLSS: dlss_eval(a); break;
@@ -22827,6 +23114,9 @@ void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t 
 void mtl_use_stats(uint64_t *call, uint64_t *skip) { *call = 0; *skip = 0; }
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full) { *load = g_bw_load; *store = g_bw_store; *full = g_pass_full_rw; }
 uint64_t mtl_udc_saved_bytes(void) { return g_udc_saved_bytes; }
+void mtl_tbdr_stats(uint64_t *fuse, uint64_t *tdc, uint64_t *tdc_bytes, uint64_t *ml_up) {
+    *fuse = g_stat_msaa_fuse; *tdc = g_stat_tdc; *tdc_bytes = g_stat_tdc_bytes; *ml_up = g_stat_memless_up;
+}
 int mtl_has_window(void) { return front_metal_layer() != NULL; }
 int mtl_link_active(void) { return link_on(); }
 int mtl_link_stalled(void) { return __atomic_load_n(&g_stall_t0, __ATOMIC_RELAXED) != 0; }   // the display link has gone silent and mtl_present_wait drops frames (see STALL_NS) until it calls back
