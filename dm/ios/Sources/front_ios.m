@@ -48,7 +48,8 @@ static UILabel *front_ios_fps_label(void);
         }];
         CAMetalLayer *l = (CAMetalLayer *)self.layer;
         l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        l.contentsScale = MAX(self.traitCollection.displayScale, 1); l.framebufferOnly = YES; l.opaque = YES;
+        const char *fx = getenv("DM_PRESENT_UPSCALE");
+        l.contentsScale = MAX(self.traitCollection.displayScale, 1); l.framebufferOnly = !(fx && (!strcmp(fx, "metalfx") || !strcmp(fx, "1"))); l.opaque = YES;
         self.backgroundColor = UIColor.blackColor;
     }
     return self;

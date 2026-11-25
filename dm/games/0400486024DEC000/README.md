@@ -16,6 +16,7 @@ A Switch 2 game: update 1.1.1 (v131072), SDK 22.2.8 (`Ounce`). Nintendo EPD's en
 | `shader_groups`, `shader_note` | `game.tsv` | shaders grouped as `/Shader/`, `/Effect/`, `/Lib/`, `/UI/` |
 | `pad_layout full` | `game.tsv` | a 3D field and both sticks |
 | Screen-shape stubs | [`patches.py`](patches.py) | taller-than-16:9 aspects (`DM_SCREEN_ASPECT`) scale the display/scene heights, base resolution, 3D perspective projection, and `Layout2` ortho and full-screen pane matrices ([Screen shape](#screen-shape-dm_screen_aspect-current)) |
+| `pso_mtl4 on`, `pso_gpu g16p` | `game.tsv` | offline Metal 4 pipeline archive for iPhone 15 Pro (`g16p`), pending on-device A17 Pro validation |
 
 Render conditions, which the host evaluates for every game ([Conditional rendering evaluated at replay](../../../docs/reference/rendering.md#conditional-rendering-evaluated-at-replay); until 2026-11-12 the profile key `render_cond`): agl clears a copy of the prepass depth again under a render condition the console skips. Run unconditionally, the opaque pass's `EQUAL` test fails everywhere ([PR 1299](https://github.com/seedds/nxnative/pull/1299)'s finding).
 
