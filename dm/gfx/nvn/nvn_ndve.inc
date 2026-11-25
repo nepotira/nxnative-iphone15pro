@@ -113,9 +113,9 @@ static id<MTLTexture> ndve_tex_id(NvShader *cs, int kind, int reg, int *id_out) 
         const nvn_rbind *b = &cs->rf.b[i]; if (b->kind != kind || b->reg != reg) continue;
         int tid = kind == NVN_RB_TEX ? bound_tex_id(bound_tex(5, b->reg)) : b->reg < 32 ? bound_tex_id(bound_img(5, b->reg)) : -1;
         id<MTLTexture> t = nil; uint64_t rid = 0; int real = 0;
-        os_unfair_lock_lock(&g_rmu);
+        rmu_lock();
         if (tid >= 0 && tid < g_ntreg && g_treg[tid].ok) { if (kind == NVN_RB_IMG) { t = img_binding(tid, b, &rid, &real); if (!real) t = nil; } else t = tex_by_id(tid); }
-        os_unfair_lock_unlock(&g_rmu);
+        rmu_unlock();
         if (id_out) *id_out = tid;
         return t;
     }

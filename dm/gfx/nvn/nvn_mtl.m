@@ -9500,7 +9500,7 @@ static void img_fit_upgrade(void) {
     for (int i = 0; i < g_imfit_npend; i++) { int tid = g_imfit_pend[i];
         if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok || g_treg[tid].gone) continue;
         id<MTLTexture> b = tex_mtl_replay(&g_treg[tid].t); if (b.parentTexture) b = b.parentTexture;
-        if (b && !(b.usage & MTLTextureUsagePixelFormatView)) tex_upgrade_pfv(&g_treg[tid].t, b, MTLPixelFormatR32Uint); }
+        if (b && (!(b.usage & MTLTextureUsagePixelFormatView) || b.compressionType == MTLTextureCompressionTypeLossy)) tex_upgrade_pfv(&g_treg[tid].t, b, MTLPixelFormatR32Uint); }
     g_imfit_npend = 0;
     rmu_unlock();
 }
@@ -9530,7 +9530,7 @@ static id<MTLTexture> img_fit(int tid, id<MTLTexture> t, int dpf, MTLTextureType
     if (!ns) {
         RED_ONCE(157, "image slot declared as Metal type %lu holds texture ID %d of type %lu (Metal format %lu, %lux%lu): no view bridges them, bound as is (its accesses are undefined, its stores lost)",
                  (unsigned long)want, tid, (unsigned long)t.textureType, (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height); return nil; }
-    if (cls && !(base.usage & MTLTextureUsagePixelFormatView)) {   // made without the format-view usage (it costs lossless compression, so textures get it only when needed): upgraded before the next
+    if ((cls && !(base.usage & MTLTextureUsagePixelFormatView)) || (base.compressionType == MTLTextureCompressionTypeLossy && pf != base.pixelFormat)) {   // made without the format-view usage (it costs lossless compression, so textures get it only when needed): upgraded before the next
         int seen = 0; for (int i = 0; i < g_imfit_npend; i++) seen |= g_imfit_pend[i] == tid;   // draw pass opens, as an upgrade copies the texture and so cannot run inside this draw's pass;
         if (!seen && g_imfit_npend < 16) g_imfit_pend[g_imfit_npend++] = tid;                  // until then the slot is bound as is
         return nil; }
@@ -15144,6 +15144,11 @@ static int img_pool_elem(int tid, const nvn_rbind *b, uint64_t *rid, uint32_t *l
         NSUInteger ns = t.textureType != want ? fit_layers(t, want) : t.textureType == MTLTextureType3D ? 1 : t.arrayLength * (t.textureType == MTLTextureTypeCube || t.textureType == MTLTextureTypeCubeArray ? 6 : 1);
         if (pf == MTLPixelFormatInvalid || !ns) return 0;
         if ((want == MTLTextureTypeCube || want == MTLTextureTypeCubeArray) && t.width != t.height) return 0;
+        if (base.compressionType == MTLTextureCompressionTypeLossy && pf != base.pixelFormat) {
+            int seen = 0; for (int i = 0; i < g_imfit_npend; i++) seen |= g_imfit_pend[i] == tid;
+            if (!seen && g_imfit_npend < 16) g_imfit_pend[g_imfit_npend++] = tid;
+            return 0;
+        }
         if (cls && !(base.usage & MTLTextureUsagePixelFormatView)) return 0;
         vc_key k; memset(&k, 0, sizeof k); k.pf = (uint32_t)pf; k.tt = (uint8_t)want; k.l0 = (uint32_t)l0; k.nl = (uint32_t)t.mipmapLevelCount; k.s0 = (uint32_t)s0; k.ns = (uint32_t)ns;
         k.sw[0] = MTLTextureSwizzleRed; k.sw[1] = MTLTextureSwizzleGreen; k.sw[2] = MTLTextureSwizzleBlue; k.sw[3] = MTLTextureSwizzleAlpha;
@@ -16435,7 +16440,7 @@ static void msaa_fuse_try(MTL4RenderPassDescriptor *pd) {
                 const p_set_rt *rt = a;
                 int empty = !rt->depth;
                 for (int i = 0; i < rt->n && i < 8; i++) if (rt->color[i]) empty = 0;
-                if (!empty || !unb_on()) return;   // Only an empty unbind stays open via g_unb; new targets end this pass before OP_COPY_T2T
+                if (!empty || !rtc_on() || !unb_on()) return;   // Only an empty unbind stays open via g_unb (requires rtc_on && unb_on); new targets end this pass before OP_COPY_T2T
                 unbind_seen = 1;
                 continue;
             }
@@ -16456,7 +16461,7 @@ static void msaa_fuse_try(MTL4RenderPassDescriptor *pd) {
                 int matched = 0;
                 for (int k = 0; k < g_nsd; k++) {
                     sd_att *t = &g_sd[k];
-                    if (t->depth != 0 || t->resolve || t->ser != cp->src->serial || t->lv != sl || t->sl != sz0) continue;
+                    if (t->depth != 0 || t->resolve || t->ser != cp->src->serial || t->lv != sl || t->sl != sz0 || (R.rt.has_cview[t->idx] && R.rt.cview[t->idx].set_format)) continue;
                     MTLRenderPassColorAttachmentDescriptor *c = pd.colorAttachments[t->idx];
                     if (!c.texture || c.texture.sampleCount <= 1 || c.texture.textureType == MTLTextureType3D || fmt_int_or_ds(c.texture.pixelFormat)) continue;
                     id<MTLTexture> dt = tex_mtl_all(cp->dst);
@@ -16533,7 +16538,7 @@ static int sd_transient_dead_ds(const sd_att *d_att, const sd_att *s_att) {
                 continue;
             case OP_CLEAR_DS: {
                 const p_clear_ds *c = a;
-                if (!cur_d || cur_d->serial != tex->serial) continue;
+                if (!cur_d || cur_d->serial != tex->serial || (cur_has_dv && cur_dv.set_format)) continue;
                 unsigned dlv = cur_has_dv && cur_dv.set_levels ? cur_dv.base_level : 0;
                 unsigned dsl = cur_has_dv && cur_dv.set_layers ? cur_dv.min_layer : 0;
                 if (dlv != ref->lv || dsl != ref->sl) continue;
@@ -16608,7 +16613,7 @@ static int sd_transient_dead_msaa_color(const sd_att *t) {
                 const p_clear_color *c = a;
                 if (c->index < 0 || c->index >= cur_rt.n || c->index >= 8 || !cur_rt.color[c->index]) continue;
                 const tex_t *ct = cur_rt.color[c->index];
-                if (ct->serial != tex->serial) continue;
+                if (ct->serial != tex->serial || rt_dup_slot(&cur_rt, c->index)) continue;
                 unsigned clv = cur_rt.has_cview[c->index] && cur_rt.cview[c->index].set_levels ? cur_rt.cview[c->index].base_level : 0;
                 unsigned csl = cur_rt.has_cview[c->index] && cur_rt.cview[c->index].set_layers ? cur_rt.cview[c->index].min_layer : 0;
                 if (clv != t->lv || csl != t->sl) continue;
@@ -20774,8 +20779,7 @@ static void clear_tex(const p_clear_tex *c) {
     if (c->has_view && c->view.set_format) {   // View with changed format: the clear value is interpreted in the view format (all 5 of the game's calls are the ui version with an integer view), and the clear is done on a view of the same format
         uint32_t vpf = 0; uint8_t swz[4];
         if (!nvn_fmt_to_mtl(c->view.format, &vpf, swz) || !vpf) { RED_ONCE(42, "texture clear view format %#x has no equivalent", c->view.format); return; }
-        if ((tex_need_pfv(t.pixelFormat, (MTLPixelFormat)vpf) && !(t.usage & MTLTextureUsagePixelFormatView))
-            || (t.compressionType == MTLTextureCompressionTypeLossy && t.pixelFormat != (MTLPixelFormat)vpf)) t = tex_upgrade_pfv(c->tex, t, (MTLPixelFormat)vpf);
+        if (tex_need_pfv(t.pixelFormat, (MTLPixelFormat)vpf) && (!(t.usage & MTLTextureUsagePixelFormatView) || t.compressionType == MTLTextureCompressionTypeLossy)) t = tex_upgrade_pfv(c->tex, t, (MTLPixelFormat)vpf);
         if (tex_need_pfv(t.pixelFormat, (MTLPixelFormat)vpf)) {
             id<MTLTexture> v = [t newTextureViewWithPixelFormat:(MTLPixelFormat)vpf];
             if (!v) { RED_ONCE(43, "texture clear: cannot create the view: format %lu → %u", (unsigned long)t.pixelFormat, vpf); return; }

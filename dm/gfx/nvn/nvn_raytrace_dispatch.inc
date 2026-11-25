@@ -89,11 +89,11 @@ static void dispatch_rays(const p_rt_dispatch *dp) {
     memcpy(p + DMSH_RT_MEMBERSHIP * 4u, rt->membership.bytes, rt->membership.length);
     rt_argument_values values = {.scene=scene.resource_id, .parameters=parameters.gpuAddress+po, .errors=errors.gpuAddress+eo,
         .instance_sbt=scene.instance_sbt_offsets, .bank0=library->bank0.gpuAddress, .bank3=constants.gpuAddress+co};
-    os_unfair_lock_lock(&g_rmu);
+    rmu_lock();
     for (unsigned i = 0; i < DMSH_RT_IMAGE_SLOTS; i++) {
         values.image_class[i] = rtd_image_class(i); rtd_u32(p, (DMSH_RT_IMAGE_CLASSES + i) * 4u, values.image_class[i]);
     }
-    os_unfair_lock_unlock(&g_rmu);
+    rmu_unlock();
     cbs_note(shader); za_shader((__bridge const void *)shader, shader->key);
     // Preparing descriptors can upload a sampled view. Finish that before the
     // query barrier; bind the completed argument block after opening the encoder.
