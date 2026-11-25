@@ -16403,9 +16403,11 @@ static void fused_res_on_pass_end(void) {
 }
 static int tex_storage_overlap(const tex_t *a, const tex_t *b);
 static int bcp_find(const tex_t *t, tex_t *o);
+static int rtc_on(void);
 static inline id<MTLTexture> tex_root_of(id<MTLTexture> t) {
-    while (t && t.parentTexture) t = t.parentTexture;
-    return t;
+    id<MTLTexture> r = t;
+    while (r && r.parentTexture) r = r.parentTexture;
+    return r;
 }
 static int pd_tex_collides(MTL4RenderPassDescriptor *pd, id<MTLTexture> dt) {
     id<MTLTexture> dr = tex_root_of(dt);
@@ -19345,7 +19347,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     }
     g_kd_force = 0;
     udc_note_draw(pr, raster_mask);
-    fbd_draw_note(pr, mp, sc, g_mtk.on);
+    fbd_draw_note(pr, mp, g_ed.sc, g_mtk.on);
     swrite_note(pr); order_note(pr);
     if (g_fsp_pass) { fsp_encode(en, mp, dw, di); if (g_fsm_na) fsm_run((id<MTL4RenderCommandEncoder>)en); rp_end(); return; }
     if (g_mtk.on) { mtk_encode(en); return; }
