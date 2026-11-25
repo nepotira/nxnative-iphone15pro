@@ -311,7 +311,7 @@ static uint8_t *reback_take(const uint8_t *mem, size_t *alen_out) {
 }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
-    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0; o->asked = 0;
+    o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0; o->asked = 0; o->v_aliased = 0;
     uint8_t *share_mem = o->mem;
     // Physical pool the CPU cannot access, starting inside a host page (4 KB Switch alignment under a 16 KB host page): back with host-page-aligned storage so vm_remap into sparse virtual pools is zero-copy
     if (o->mem && (o->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL) && (o->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS)) {
@@ -2656,10 +2656,10 @@ static void power_line(uint64_t frame) {
         if (gn != pgn) LOG("[nvn] GPU texture storage up to frame %llu: %llu regions, %.1f MB written into their storage on the GPU (%.2f regions, %.2f MB per frame)",
             frame, (unsigned long long)(gn - pgn), (gb - pgb) / 1048576.0, (gn - pgn) / nf, (gb - pgb) / 1048576.0 / nf);
         pgn = gn; pgb = gb;
-        void mtl_tbdr_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *); static uint64_t ptf, ptd, ptb, pml; uint64_t tf, td, tb, ml; mtl_tbdr_stats(&tf, &td, &tb, &ml);
-        if (tf != ptf || td != ptd || ml != pml) LOG("[nvn] TBDR opts up to frame %llu: MSAA resolves fused %llu (%.2f/frame), transient depth/stencil stores elided %llu (%.1f MB, %.2f MB/frame), memoryless materializations %llu",
-            frame, (unsigned long long)(tf - ptf), (tf - ptf) / nf, (unsigned long long)(td - ptd), (tb - ptb) / 1048576.0, (tb - ptb) / 1048576.0 / nf, (unsigned long long)(ml - pml));
-        ptf = tf; ptd = td; ptb = tb; pml = ml;
+        void mtl_tbdr_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t ptf, ptd, ptb; uint64_t tf, td, tb; mtl_tbdr_stats(&tf, &td, &tb);
+        if (tf != ptf || td != ptd) LOG("[nvn] TBDR opts up to frame %llu: MSAA resolves fused %llu (%.2f/frame), transient depth/stencil stores elided %llu (%.1f MB, %.2f MB/frame)",
+            frame, (unsigned long long)(tf - ptf), (tf - ptf) / nf, (unsigned long long)(td - ptd), (tb - ptb) / 1048576.0, (tb - ptb) / 1048576.0 / nf);
+        ptf = tf; ptd = td; ptb = tb;
         char tc[400]; dm_thread_cpu(tc, sizeof tc, s);
         LOG("[nvn] threads up to frame %llu: CPU %s", frame, tc); }
     else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines
@@ -3947,6 +3947,7 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
     if (((uint64_t)r->voff | r->size | (uint64_t)r->poff) & 0xFFF) { LOG("[RED] virtual pool %p: request %#llx+%#llx (physical offset %#llx) is not 4 KB aligned", (const void *)v->pool, (unsigned long long)r->voff, (unsigned long long)r->size, (unsigned long long)r->poff); return 0; }
     const pool_t *ph = (const pool_t *)r->phys;
     if (ph && (!ph->mem || r->poff < 0 || (uint64_t)r->poff + r->size > ph->size)) { LOG("[RED] virtual pool %p: physical pool %p (%#llx bytes, storage %p) cannot supply %#llx+%#llx", (const void *)v->pool, (const void *)ph, (unsigned long long)ph->size, (void *)ph->mem, (unsigned long long)r->poff, (unsigned long long)r->size); return 0; }
+    if (ph) __atomic_store_n(&((pool_t *)ph)->v_aliased, 1, __ATOMIC_RELEASE);
     vpt_set(v, (uint64_t)r->voff, r->size, ph ? ph->mem + r->poff : NULL);
     if (v->nsh) vshadow_cut(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size);
     vm_address_t to = (vm_address_t)(v->base + r->voff);
@@ -4010,6 +4011,7 @@ NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappi
         if (r[i].voff < 0 || (uint64_t)r[i].voff + r[i].size > o->size || (uint64_t)r[i].poff + r[i].size > ph->size) { LOG("[RED] MapVirtual: request out of range (virtual %#llx+%#llx / pool %#llx, physical %#llx / pool %#llx)", (unsigned long long)r[i].voff, (unsigned long long)r[i].size, (unsigned long long)o->size, (unsigned long long)r[i].poff, (unsigned long long)ph->size); return 0; }
         if (o->mem && o->mem != base) { LOG("[RED] MapVirtual: non-contiguous mapping (true sparse) not implemented: virtual pool %p already maps to %p, this request wants %p", (void *)o, (void *)o->mem, (void *)base); return 0; }
         if (!o->mem) LOG("[nvn] MapVirtual: the storage of virtual pool %p (%#llx bytes) points at physical pool %p + %#llx", (void *)o, (unsigned long long)o->size, (const void *)ph, (unsigned long long)(r[i].poff - r[i].voff));
+        __atomic_store_n(&((pool_t *)ph)->v_aliased, 1, __ATOMIC_RELEASE);
         o->mem = base;
         // An address may have been given out before it had storage (in the pool's own reserved range). Where none was and the CPU cannot reach the pool, it holds only textures whose
         // content Metal keeps apart (tex_bytes_elsewhere), so the mapping does not put the physical pool into the raw pool table; a buffer or the pool's address given out later does.
