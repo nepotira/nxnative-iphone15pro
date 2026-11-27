@@ -717,16 +717,33 @@ static void tu_register(id<MTLTexture> t, uint64_t serial) {
     if (g_tu_gone.n && nvn_hm_del(&g_tu_gone, &serial)) g_tu_remade++;
     os_unfair_lock_unlock(&g_tu_lk);
 }
-// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed; all of them when memory is short (mem_trim). → bytes freed
+// When a submission begins: heaps that waited RH_IDLE_NS, and the oldest past RH_CAP bytes, leave the residency set and are freed; all of them when memory is short (mem_trim).
+// When DM_MEM_GOVERNOR is enabled (default on iOS), headroom-driven g_mem_tier tightens RH_CAP and RH_IDLE_NS before Jetsam. → bytes freed
+static _Atomic int g_mem_tier;
+static int mem_gov_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DM_MEM_GOVERNOR");
+#if TARGET_OS_IPHONE
+        on = !e || atoi(e) != 0;
+#else
+        on = e && atoi(e) != 0;
+#endif
+    }
+    return on;
+}
 static uint64_t rh_trim_n(int all, unsigned *n_out) {
     if (!g_rh_n) { if (n_out) *n_out = 0; return 0; }
+    int tier = (!all && mem_gov_on()) ? atomic_load_explicit(&g_mem_tier, memory_order_relaxed) : 0;
+    uint64_t idle_ns = tier == 0 ? RH_IDLE_NS : (tier == 1 ? 1000000000ull : (tier == 2 ? 500000000ull : 0ull));
+    uint64_t cap = tier == 0 ? RH_CAP : (tier == 1 ? (64u << 20) : (tier == 2 ? (32u << 20) : 0u));
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC), bytes = 0; unsigned n = 0;
     for (;;) {
         void *drop[64]; unsigned nd = 0;
         os_unfair_lock_lock(&g_rh_lk);
         while (g_rh_n && nd < 64) {
             unsigned old = 0; for (unsigned i = 1; i < g_rh_n; i++) if (g_rh[i].t < g_rh[old].t) old = i;
-            if (!all && now - g_rh[old].t < RH_IDLE_NS && g_rh_bytes <= RH_CAP) break;
+            if (!all && now - g_rh[old].t < idle_ns && g_rh_bytes <= cap) break;
             drop[nd++] = g_rh[old].heap; bytes += g_rh[old].size; g_rh_bytes -= g_rh[old].size; g_rh[old] = g_rh[--g_rh_n];
         }
         int more = all && g_rh_n;
@@ -2045,6 +2062,44 @@ static uint64_t spare_trim(int all, unsigned *n_out);
 static void movie_kept_flush(void);
 static void movie_trim(int all);
 static unsigned g_evict_why[5];   // the last trim's packages (pkg_evict_idle): considered, used within PKG_IDLE_DS, of a kind not freed (sparse, placed, a view), GPU-written, held (pin, sharing table, takeover)
+__attribute__((weak)) extern void nvn_queue_pool_trim(int drop_all);
+static void mem_governor_tick(void) { @autoreleasepool {
+    if (!mem_gov_on()) return;
+    static uint64_t last_ns;
+    int prev = atomic_load_explicit(&g_mem_tier, memory_order_relaxed);
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (last_ns && now - last_ns < 500000000ull) return;
+    last_ns = now;
+    unsigned long long avail_mb = 0;
+    int tier = 0;
+#if TARGET_OS_IPHONE
+    avail_mb = (unsigned long long)(os_proc_available_memory() >> 20);
+    // Drive g_mem_tier exclusively from process Jetsam headroom (never thermal state), with 50 MB step-down hysteresis.
+    int raw = avail_mb < 250 ? 3 : (avail_mb < 450 ? 2 : (avail_mb < 800 ? 1 : 0));
+    if (raw >= prev) tier = raw;
+    else {
+        tier = prev;
+        if (tier == 3 && avail_mb >= 300) tier = 2;
+        if (tier == 2 && avail_mb >= 500) tier = 1;
+        if (tier == 1 && avail_mb >= 850) tier = 0;
+    }
+#endif
+    atomic_store_explicit(&g_mem_tier, tier, memory_order_relaxed);
+    if (tier != prev) {
+        MLOG("memory governor: tier %d -> %d (headroom %llu MB, gpu %llu MB)",
+             prev, tier, avail_mb, (unsigned long long)(g_dev ? (g_dev.currentAllocatedSize >> 20) : 0));
+    }
+    if (tier >= 1) {
+        uint32_t keep = tier == 1 ? 256u : (tier == 2 ? 64u : 0u);
+        uint32_t idle_f = tier == 1 ? 8u : (tier == 2 ? 4u : 2u);
+        uint32_t idle_s = tier == 1 ? 512u : (tier == 2 ? 128u : 32u);
+        unsigned budget = tier == 1 ? 32u : 48u;   // stay below SER_NOTES (64) so a tick does not force ser_sync's slow path
+        (void)own_ghost_trim_target(keep, idle_f, idle_s, budget);
+    }
+    if (tier >= 2) {
+        if (nvn_queue_pool_trim) nvn_queue_pool_trim(tier >= 3);
+    }
+} }
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; g_seg = 0; g_vis_need = 1;   // until its first samples-passed reset or report (vis_need_scan)
     treg_sparse_notes();   // the mappings made before this submission
@@ -2052,6 +2107,7 @@ void mtl_sub_begin(void) {
     if (g_pkg_kept) { g_pkg_kept = 0; nvn_dirty_touch(); } seg_clk_put(g_sclk); g_sclk = NULL;
     movie_kept_flush();
     sub_cut_begin();
+    mem_governor_tick();
     defer_drain();
     rh_trim();
     tu_tick();   // the render targets drawn over since their last use go, once a second
@@ -3983,9 +4039,9 @@ static size_t up_src_budget(void) {
     static size_t bytes = SIZE_MAX;
     if (bytes == SIZE_MAX) {
         const char *e = getenv("DM_NVN_UPLOAD_SRC_MB");
-        char *end;
-        long long mb = e ? strtoll(e, &end, 10) : 0;
-        bytes = mb > 0 && (unsigned long long)mb <= (SIZE_MAX >> 20) && !*end ? (size_t)mb << 20 : 0;
+        char *end = NULL;
+        long long mb = e ? strtoll(e, &end, 10) : (mem_gov_on() ? 64 : 0);
+        bytes = mb > 0 && (unsigned long long)mb <= (SIZE_MAX >> 20) && (!e || !*end) ? (size_t)mb << 20 : 0;
     }
     return bytes;
 }
@@ -3997,16 +4053,17 @@ static size_t up_slot_block_size(size_t demand) {
     return want;
 }
 
-// Idle trimming is opt-in. An explicit 0 still reports the cache for A/B runs.
+// Idle trimming is opt-in on Mac and defaults to 2000 ms under DM_MEM_GOVERNOR. An explicit 0 still reports the cache for A/B runs.
 static int g_up_idle_report;
 static uint64_t up_idle_period(void) {
     static int64_t ns = -1;
     if (ns < 0) {
         const char *e = getenv("DM_NVN_UPLOAD_IDLE_MS");
-        g_up_idle_report = e && *e;
-        char *end;
-        int64_t ms = g_up_idle_report ? strtoll(e, &end, 10) : 0;
-        ns = ms > 0 && ms <= INT64_MAX / 1000000 && !*end ? ms * 1000000 : 0;
+        int has_env = e && *e;
+        g_up_idle_report = has_env || mem_gov_on();
+        char *end = NULL;
+        int64_t ms = has_env ? strtoll(e, &end, 10) : (mem_gov_on() ? 2000 : 0);
+        ns = ms > 0 && ms <= INT64_MAX / 1000000 && (!has_env || !*end) ? ms * 1000000 : 0;
     }
     return (uint64_t)ns;
 }
@@ -4027,14 +4084,19 @@ static void up_idle_drop(__strong id<MTLBuffer> *block) {
 
 static void up_idle_release(void) {
     uint64_t idle = up_idle_period();
+    int tier = mem_gov_on() ? atomic_load_explicit(&g_mem_tier, memory_order_relaxed) : 0;
     if (!g_up_idle_report || g_up_cb) return;
+    if (tier >= 1 && idle) {
+        uint64_t cap_ns = tier == 1 ? 1000000000ull : (tier == 2 ? 250000000ull : 1ull);
+        if (idle > cap_ns) idle = cap_ns;
+    }
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     uint64_t before = g_up_idle_n;
     for (unsigned s = 0; idle && s < 3; s++) {
         // Only the upload batch uses these blocks. Its feedback handler clears busy after GPU completion.
         up_idle_slot *age = &g_up_idle_slot[s];
         if (!age->used_ns || atomic_load(&g_up_alloc_busy[s])) continue;
-        if (now - age->used_ns >= idle) {
+        if (tier >= 3 || now - age->used_ns >= idle) {
             up_idle_drop(&g_up_slot_blk[s]);
             up_idle_drop(&g_up_slot_over[s]);
             g_up_slot_want[s] = 0;
@@ -4254,7 +4316,6 @@ static id<MTLBuffer> up_alloc(size_t n, size_t *off) {
 // 30 s (pkg_evict_idle), the staging blocks of upload slots with no batch open or in flight, and completed deferred releases. Each trim is logged with what it freed and the system's free memory after it
 static uint64_t pkg_evict_idle(unsigned *n_out);
 static uint64_t geo_big_trim(uint64_t idle, unsigned *n_out);
-__attribute__((weak)) extern void nvn_queue_pool_trim(int drop_all);
 static void mem_trim(void) {
     int lv = atomic_exchange(&g_mp_want, 0);
     if (!lv) return;
@@ -9767,7 +9828,9 @@ static void geo_big_commit(uint64_t fence) {
 void arena_begin(void) {
     if (!g_arenas) { g_arenas = [NSMutableArray array]; g_sub_arenas = [NSMutableArray array]; }
     g_cur_arena = nil;
-    arena_trim(ARENA_IDLE);
+    int tier = mem_gov_on() ? atomic_load_explicit(&g_mem_tier, memory_order_relaxed) : 0;
+    uint64_t idle = tier == 0 ? ARENA_IDLE : (tier == 1 ? 180u : (tier == 2 ? 30u : 2u));
+    arena_trim(idle);
     if (g_arena_next) { NvArena *a = g_arena_next; g_arena_next = nil; [g_arenas removeObjectIdenticalTo:a]; [g_sub_arenas addObject:a]; g_cur_arena = a; }
 }
 void arena_commit(uint64_t fence) {
@@ -15000,6 +15063,7 @@ static uint64_t pool_walk(int samp, int dtt, int dpf, int base, __unsafe_unretai
 // most: each serial that goes is a note, and past SER_NOTES of them every texture ID takes the slow path once
 enum { TU_IDLE = 30, TU_MAX = 256 };   // deciseconds; textures a pass
 static uint32_t g_tu_last;   // g_tu_now at the last pass
+static int g_tu_manual;      // the tests keep the clock themselves and call tu_pass
 static uint64_t g_tu_n, g_tu_bytes, g_tu_serials, g_tu_pinned, g_tu_ns, g_tu_passes;
 static int tu_use_of(id o, own_use *u) {   // own_use_fn; the pass's mark keeps the record (the sweep below)
     uintptr_t k = (uintptr_t)(__bridge void *)o;
@@ -15023,8 +15087,11 @@ static void tu_pass(void) { @autoreleasepool {
     rmu_unlock();
     if (!g_tu.n) return;
     uint64_t *sers = NULL; uint32_t nser = 0;
+    int tier = (!g_tu_manual && mem_gov_on()) ? atomic_load_explicit(&g_mem_tier, memory_order_relaxed) : 0;
+    uint32_t tu_idle = tier == 0 ? TU_IDLE : (tier == 1 ? 20u : (tier == 2 ? 10u : 5u));
+    uint32_t tu_max = tier >= 2 ? (TU_MAX * 2u) : TU_MAX;
     pthread_mutex_lock(&g_smu);
-    own_dead_stats st = own_alias_dead_locked(now, TU_IDLE, tu_use_of, TU_MAX, &sers, &nser);
+    own_dead_stats st = own_alias_dead_locked(now, tu_idle, tu_use_of, tu_max, &sers, &nser);
     pthread_mutex_unlock(&g_smu);
     if (nser) {
         rmu_lock();
@@ -15046,11 +15113,10 @@ static void tu_pass(void) { @autoreleasepool {
     g_tu_n += st.n; g_tu_bytes += st.bytes; g_tu_serials += st.serials; g_tu_pinned += st.pinned; g_tu_ns += bp_now() - t0; g_tu_passes++;
     static uint64_t at, was; uint64_t f = atomic_load(&g_cur_frame);
     if (f >= at + 300 && g_tu_n != was) { at = f; was = g_tu_n;
-        MLOG("render targets drawn over and unused for %u s, released up to frame %llu: %llu textures, %llu MB (%llu serial entries with them; %llu kept by a pin), %llu made again; %u covered now; %llu passes, %.2f ms in all",
-             TU_IDLE / 10, (unsigned long long)f, (unsigned long long)g_tu_n, (unsigned long long)(g_tu_bytes >> 20), (unsigned long long)g_tu_serials, (unsigned long long)g_tu_pinned, (unsigned long long)remade, live,
+        MLOG("render targets drawn over and unused for %.1f s, released up to frame %llu: %llu textures, %llu MB (%llu serial entries with them; %llu kept by a pin), %llu made again; %u covered now; %llu passes, %.2f ms in all",
+             tu_idle / 10.0, (unsigned long long)f, (unsigned long long)g_tu_n, (unsigned long long)(g_tu_bytes >> 20), (unsigned long long)g_tu_serials, (unsigned long long)g_tu_pinned, (unsigned long long)remade, live,
              (unsigned long long)g_tu_passes, g_tu_ns / 1e6); }
 } }
-static int g_tu_manual;   // the tests keep the clock themselves and call tu_pass
 static int tu_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_RT_DEAD", 1); return m; }
 static void tu_tick(void) {   // when a submission begins; DM_NVN_RT_DEAD=0 keeps them all (the stamps go on), ab alternates it with the DM_AB phases
     if (g_tu_manual) return;
@@ -20868,12 +20934,12 @@ static void sub_cut(void) {
     if (g_enc || !sub_cut_ready()) return;
     // The cut is there so that the GPU does not sit idle while the host encodes. With earlier work still running, queueing many command buffers triggers kernel stalls on Metal's one
     // submission queue (docs/reference/frame-rate.md). Live GPU progress is read from g_q4's shared event (rx_inflight) rather than addFeedbackHandler, which lags GPU completion by
-    // 0.17–1.2 ms. On the encode thread (rec_on() && rx_merge_on()), the segment is still split here and held on the encode thread (REC_CMT_SEG) until rx_inflight() < lim, so submit-thread
-    // lookahead cannot collapse the rest of the frame into one command buffer. A copy still commits immediately (REC_CMT_NOW), as its data must land. DM_NVN_CUT_BUSY=0: every cut commits;
+    // 0.17–1.2 ms. Suppress mid-submission cuts whenever rx_inflight() >= lim (including with DM_NVN_ENC_THREAD=1 and DM_NVN_SUB_MERGE=1) so heavy frames do not explode into ~10 CBs/frame,
+    // while end-of-submission merging (REC_CMT_END in mtl_sub_commit) remains intact. A copy still commits immediately (REC_CMT_NOW), as its data must land. DM_NVN_CUT_BUSY=0: every cut commits;
     // DM_NVN_CUT_BUSY=N: commit while fewer than N commits are in flight (default 1: only when earlier work on g_q4 has finished)
     int lim = cut_busy_limit();
     int can_hold = lim > 0 && !g_cut_copy && (!seg_ts() || ts_on());
-    if (can_hold && (!rec_on() || !rx_merge_on()) && rx_inflight() >= (uint64_t)lim) {
+    if (can_hold && rx_inflight() >= (uint64_t)lim) {
         if (ts_on()) { ts_boundary(); g_seg++; }
         g_cut_draw0 = g_stat_draw; return; }
     if (g_tf_enc) tf_pass_end();
@@ -20896,7 +20962,7 @@ static void sub_cut(void) {
         char where[64]; snprintf(where, sizeof where, "fence %llu, segment %u", (unsigned long long)cbs_fence, k); cbs_feedback(cbs, cb.error, where);
         gpu_lost_check(cb.error, "segment");
     }];
-    cb_commit(o, (can_hold && rec_on() && rx_merge_on()) ? REC_CMT_SEG : REC_CMT_NOW);
+    cb_commit(o, REC_CMT_NOW);
     if (rec_on()) rec_publish();   // the segment reaches the encode thread now, not when its block of records fills
     g_cb = rec_cb_new();
     [g_cb beginCommandBufferWithAllocator:g_alloc4[g_alloc_cur]];   // one allocator encodes several command buffers in sequence; it is reset only once its fence (the last segment) has passed, when a later submission starts

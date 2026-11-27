@@ -78,6 +78,7 @@ void serial_del(uint64_t k);         // a live serial's entry goes (a finalize, 
 id own_ext_take(uint64_t k);         // an external texture's live entry (2^62 and up) goes and its object comes back to the caller, unretired (nil: none)
 void tex_put(uint64_t k, id o);      // a texture serial's object: live table for a live texture object or an external texture, else the ghost table (its use stamped)
 void own_ghost_trim(void);           // a submission's commit: idle ghost entries past NGHOST go, GHOST_TRIM at most
+uint32_t own_ghost_trim_target(uint32_t keep, uint32_t idle_frames, uint32_t idle_subs, unsigned budget);   // pressure-driven ghost eviction down to `keep`
 
 // The sharing table. A key's padding is zero (it is hashed): build one with memset or a zeroed initializer, and change a copy's fields
 typedef struct { uint64_t pool; int64_t off; nvn_texdesc d; } alias_key;

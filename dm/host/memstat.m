@@ -231,46 +231,138 @@ static void memstat_start(void) {
     pthread_detach(th);
 }
 
-// ---------- Per-thread CPU: DM_THRCPU=<tsv path>[,interval in seconds (default 10)] (common to Mac / iOS; on iOS a relative name → the container's Documents) ----------
-// Every interval, walk all threads of this process (task_threads), take the thread name and user + system CPU time (ns) from THREAD_EXTENDED_INFO, and difference them by thread id:
-// each line is "seconds, thread id, thread name, CPU% (100 = one core)"; the last line is "seconds, -, total, CPU%". Used for heat attribution (which thread eats CPU); enable together with DM_HEAT to compare against thermal state.
+// ---------- Per-thread CPU & task event/wakeup attribution: DM_THRCPU=<tsv path>[,interval in seconds (default 10)] (common to Mac / iOS; on iOS a relative name → the container's Documents) ----------
+// Every interval, walk all threads of this process (task_threads), take user and system CPU time from THREAD_EXTENDED_INFO, and difference them by thread id;
+// on the total row, query TASK_POWER_INFO_V2 (task_interrupt_wakeups) and TASK_EVENTS_INFO (context switches, Mach/Unix syscalls, Mach messages). Uses only public Mach headers (no libproc, no dereferencing dispatch_qaddr).
 #include <mach/thread_info.h>
+#include <mach/task_info.h>
 #define THR_MAX 512
+typedef struct {
+    uint64_t tid, user, sys;
+    uint32_t gen;
+} thrcpu_slot_t;
 static void *thrcpu_thread(void *p) {
-    char path[1024]; int iv = 10; { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen(p), (const char *)p); if (c) iv = atoi(c + 1); }
+    if (!p) return NULL;
+    pthread_setname_np("thrcpu");
+    char path[1024]; int iv = 10;
+    { const char *c = strchr((const char *)p, ','); snprintf(path, sizeof path, "%.*s", c ? (int)(c - (const char *)p) : (int)strlen((const char *)p), (const char *)p); if (c) iv = atoi(c + 1); }
+    free(p);
+    if (iv < 1) iv = 1;
     FILE *f = fopen(path, "w"); if (!f) return NULL;
-    fprintf(f, "seconds\tthread ID\tthread name\tCPU%%\n"); fflush(f);
-    static uint64_t ids[THR_MAX], last[THR_MAX]; int n = 0; uint64_t t0 = now_ns(), tl = t0;
+    fprintf(f, "seconds\tthread ID\tthread name\tCPU%%\tuser%%\tsys%%\twakeups/s\tcswitches/s\tsyscalls_mach/s\tsyscalls_unix/s\tmessages/s\n"); fflush(f);
+    static thrcpu_slot_t slots[THR_MAX]; int n = 0; uint32_t gen = 0;
+    uint64_t t0 = now_ns(), tl = t0;
+    uint64_t prev_iw = 0; int prev_pw_ok = 0;
+    { task_power_info_v2_data_t pw; mach_msg_type_number_t pwc = TASK_POWER_INFO_V2_COUNT;
+      if (task_info(mach_task_self(), TASK_POWER_INFO_V2, (task_info_t)&pw, &pwc) == KERN_SUCCESS) {
+          prev_iw = pw.cpu_energy.task_interrupt_wakeups; prev_pw_ok = 1;
+      } }
+    uint32_t prev_csw = 0, prev_smach = 0, prev_sunix = 0, prev_msgs = 0; int prev_ev_ok = 0;
+    { task_events_info_data_t tev; mach_msg_type_number_t tevc = TASK_EVENTS_INFO_COUNT;
+      if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&tev, &tevc) == KERN_SUCCESS) {
+          prev_csw = (uint32_t)tev.csw; prev_smach = (uint32_t)tev.syscalls_mach;
+          prev_sunix = (uint32_t)tev.syscalls_unix;
+          prev_msgs = (uint32_t)tev.messages_sent + (uint32_t)tev.messages_received;
+          prev_ev_ok = 1;
+      } }
     for (;;) {
-        sleep(iv); uint64_t t = now_ns(); double dt = (t - tl) / 1e9, tot = 0; tl = t;
+        sleep((unsigned)iv);
+        uint64_t t = now_ns(); double dt = (t - tl) / 1e9; tl = t;
+        if (dt <= 0.0) continue;
+        task_power_info_v2_data_t pw; mach_msg_type_number_t pwc = TASK_POWER_INFO_V2_COUNT;
+        int pw_ok = task_info(mach_task_self(), TASK_POWER_INFO_V2, (task_info_t)&pw, &pwc) == KERN_SUCCESS;
+        double wake_s = 0.0;
+        if (pw_ok) {
+            uint64_t iw = pw.cpu_energy.task_interrupt_wakeups;
+            if (prev_pw_ok && iw >= prev_iw) wake_s = (double)(iw - prev_iw) / dt;
+            prev_iw = iw; prev_pw_ok = 1;
+        } else {
+            prev_pw_ok = 0;
+        }
+        task_events_info_data_t tev; mach_msg_type_number_t tevc = TASK_EVENTS_INFO_COUNT;
+        int ev_ok = task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&tev, &tevc) == KERN_SUCCESS;
+        double csw_s = 0.0, smach_s = 0.0, sunix_s = 0.0, msg_s = 0.0;
+        if (ev_ok) {
+            uint32_t csw = (uint32_t)tev.csw, smach = (uint32_t)tev.syscalls_mach;
+            uint32_t sunix = (uint32_t)tev.syscalls_unix;
+            uint32_t msgs = (uint32_t)tev.messages_sent + (uint32_t)tev.messages_received;
+            if (prev_ev_ok) {
+                if (csw >= prev_csw) csw_s = (double)(csw - prev_csw) / dt;
+                if (smach >= prev_smach) smach_s = (double)(smach - prev_smach) / dt;
+                if (sunix >= prev_sunix) sunix_s = (double)(sunix - prev_sunix) / dt;
+                if (msgs >= prev_msgs) msg_s = (double)(msgs - prev_msgs) / dt;
+            }
+            prev_csw = csw; prev_smach = smach; prev_sunix = sunix; prev_msgs = msgs; prev_ev_ok = 1;
+        } else {
+            prev_ev_ok = 0;
+        }
+        double tot = 0.0, tot_user = 0.0, tot_sys = 0.0;
+        gen++;
         thread_act_array_t th; mach_msg_type_number_t nt = 0;
         if (task_threads(mach_task_self(), &th, &nt) != KERN_SUCCESS) continue;
         for (mach_msg_type_number_t i = 0; i < nt; i++) {
             thread_extended_info_data_t ei; mach_msg_type_number_t c1 = THREAD_EXTENDED_INFO_COUNT;
             thread_identifier_info_data_t ii; mach_msg_type_number_t c2 = THREAD_IDENTIFIER_INFO_COUNT;
             if (thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&ei, &c1) == KERN_SUCCESS && thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &c2) == KERN_SUCCESS) {
-                uint64_t cpu = ei.pth_user_time + ei.pth_system_time; int k = 0; while (k < n && ids[k] != ii.thread_id) k++;
-                if (k == n && n < THR_MAX) { ids[n] = ii.thread_id; last[n] = cpu; n++; }   // New thread: only record the baseline this round
-                else if (k < n) { double pct = (cpu - last[k]) / 1e9 / dt * 100; last[k] = cpu; tot += pct;
-                    if (pct >= 0.5) { char gn[96]; int thr_name_of(pthread_t, char *, size_t); pthread_t pt = pthread_from_mach_thread_np(th[i]);
-                        const char *nm = pt && thr_name_of(pt, gn, sizeof gn) ? gn : ei.pth_name[0] ? ei.pth_name : "-";   // Guest thread: handle + guest name; host thread: pthread name
-                        fprintf(f, "%.0f\t%llu\t%s\t%.1f\n", (t - t0) / 1e9, ii.thread_id, nm, pct); } }
+                uint64_t u = ei.pth_user_time, sy = ei.pth_system_time;
+                int k = 0; while (k < n && slots[k].tid != ii.thread_id) k++;
+                if (k == n) {
+                    if (n < THR_MAX) slots[n++] = (thrcpu_slot_t){ii.thread_id, u, sy, gen};   // New thread: baseline only
+                } else {
+                    thrcpu_slot_t *s = &slots[k];
+                    s->gen = gen;
+                    if (u < s->user || sy < s->sys) {   // TID reused with lower cumulative time: re-baseline without wraparound spike
+                        s->user = u; s->sys = sy;
+                    } else {
+                        double user_pct = (double)(u - s->user) / 1e9 / dt * 100.0;
+                        double sys_pct = (double)(sy - s->sys) / 1e9 / dt * 100.0;
+                        double pct = user_pct + sys_pct;
+                        s->user = u; s->sys = sy;
+                        tot += pct; tot_user += user_pct; tot_sys += sys_pct;
+                        if (pct >= 0.5 || sys_pct >= 0.1) {
+                            char gn[96], unm[32]; int thr_name_of(pthread_t, char *, size_t); pthread_t pt = pthread_from_mach_thread_np(th[i]);
+                            const char *nm = pt && thr_name_of(pt, gn, sizeof gn) ? gn : ei.pth_name[0] ? ei.pth_name : NULL;
+                            if (!nm) {
+                                if (ii.dispatch_qaddr != 0) snprintf(unm, sizeof unm, "-(gcd,pri=%d)", (int)ei.pth_curpri);
+                                else snprintf(unm, sizeof unm, "-(pri=%d)", (int)ei.pth_curpri);
+                                nm = unm;
+                            }
+                            fprintf(f, "%.0f\t%llu\t%s\t%.1f\t%.1f\t%.1f\t-\t-\t-\t-\t-\n",
+                                    (t - t0) / 1e9, (unsigned long long)ii.thread_id, nm, pct, user_pct, sys_pct);
+                        }
+                    }
+                }
             }
             mach_port_deallocate(mach_task_self(), th[i]);
         }
         vm_deallocate(mach_task_self(), (vm_address_t)th, nt * sizeof *th);
-        fprintf(f, "%.0f\t-\ttotal\t%.1f\n", (t - t0) / 1e9, tot); fflush(f);
+        // Compact exited threads out of the table so dead TIDs cannot exhaust THR_MAX or collide on reuse
+        int w = 0; for (int k = 0; k < n; k++) if (slots[k].gen == gen) { if (w != k) slots[w] = slots[k]; w++; }
+        n = w;
+        fprintf(f, "%.0f\t-\ttotal\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\t%.1f\n",
+                (t - t0) / 1e9, tot, tot_user, tot_sys, wake_s, csw_s, smach_s, sunix_s, msg_s);
+        fflush(f);
     }
     return NULL;
 }
 static void thrcpu_start(void) {
     const char *p = getenv("DM_THRCPU");
     if (!p || !*p) return;
-    char *spec = strdup(p);
+    char *spec = NULL;
 #if TARGET_OS_IPHONE
-    if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
+    if (*p != '/') {
+        const char *home = getenv("HOME");
+        if (!home) return;
+        size_t n = strlen(home) + strlen(p) + 16;
+        spec = malloc(n);
+        if (spec) snprintf(spec, n, "%s/Documents/%s", home, p);
+    } else
 #endif
-    pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
+    spec = strdup(p);
+    if (!spec) return;
+    pthread_t th;
+    if (pthread_create(&th, NULL, thrcpu_thread, spec) != 0) { free(spec); return; }
+    pthread_detach(th);
 }
 // DM_MEMSTAT and DM_THRCPU, started once by the host's loading (main.c host_preload), not by a constructor: on iOS a constructor runs before the app's main() sets what Documents/env.txt
 // holds, so either switch set there did nothing (GitHub issue #1184)

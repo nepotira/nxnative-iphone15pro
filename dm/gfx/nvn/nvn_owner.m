@@ -339,16 +339,26 @@ static void ghost_del_locked(uint64_t k) {   // k's ghost entry goes with its pl
     id old = hm_get_id(&g_ghost, &k); if (!old) return;
     ghost_held_add((__bridge void *)old, -1); obj_drop(old); hm_del_id(&g_ghost, &k); own_note(k);
 }
-// Idle entries past NGHOST go, least recently used first, at most `budget` of them; the first entry in use ends the walk (every one after it was used later)
-static void ghost_trim(unsigned budget) {
+// Idle entries past `keep` go, least recently used first, at most `budget` of them; the first entry in use ends the walk (every one after it was used later)
+static uint32_t ghost_trim_ex(uint32_t keep, uint32_t idle_frames, uint32_t idle_subs, unsigned budget) {
     uint64_t frame = own_hook_frame(), sub = own_hook_submission();
-    for (; budget && g_ghost.n > NGHOST && g_ghost_lru; budget--) {
+    uint32_t n = 0;
+    for (; budget && g_ghost.n > keep && g_ghost_lru; budget--) {
         const ghost_use *u = g_ghost_lru;
-        if (frame - u->frame < GHOST_IDLE && sub - u->sub < GHOST_IDLE_SUBS) break;
+        if (frame - u->frame < idle_frames && sub - u->sub < idle_subs) break;
         ghost_del_locked(u->serial);
+        n++;
     }
+    return n;
 }
+static void ghost_trim(unsigned budget) { (void)ghost_trim_ex(NGHOST, GHOST_IDLE, GHOST_IDLE_SUBS, budget); }
 void own_ghost_trim(void) { pthread_mutex_lock(&g_smu); ghost_trim(GHOST_TRIM); pthread_mutex_unlock(&g_smu); }
+uint32_t own_ghost_trim_target(uint32_t keep, uint32_t idle_frames, uint32_t idle_subs, unsigned budget) {
+    pthread_mutex_lock(&g_smu);
+    uint32_t n = ghost_trim_ex(keep, idle_frames, idle_subs, budget);
+    pthread_mutex_unlock(&g_smu);
+    return n;
+}
 const void *own_resolve_ref(uint64_t k) {
     pthread_mutex_lock(&g_smu); const void *o = nvn_hm_get(&g_by_serial, &k);
     if (!o && g_ghost.n && (o = nvn_hm_get(&g_ghost, &k))) ghost_used(k);
